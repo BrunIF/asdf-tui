@@ -130,11 +130,18 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          out="dist/asdf-tui-${VERSION}-linux-amd64"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-            -ldflags "-s -w -X main.version=${VERSION}" -o "$out" .
-          [[ "$(./$out version)" == "asdf-tui ${VERSION}" ]] \
-            || { echo "stamp mismatch" >&2; exit 1; }
+          for goarch in amd64 arm64; do
+            out="dist/asdf-tui-${VERSION}-linux-${goarch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH=${goarch} go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" -o "$out" .
+            if [[ "${goarch}" == "amd64" ]]; then
+              [[ "$(./$out version)" == "asdf-tui ${VERSION}" ]] \
+                || { echo "stamp mismatch: $out" >&2; exit 1; }
+            else
+              strings "$out" | grep -qxF "${VERSION}" \
+                || { echo "stamp missing: $out" >&2; exit 1; }
+            fi
+          done
 
       - name: Create git tag and GitHub Release
         if: env.already != '1'
