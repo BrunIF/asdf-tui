@@ -1,0 +1,17 @@
+# Build artifacts — never commit anything that `go build` produces.
+#
+#   asdf-tui                 the local dev binary from `go build .`
+#   dist/                    release binaries produced by the CI matrix
+#   *.exe                    cross-compiled Windows builds if run manually
+/asdf-tui
+/dist/
+*.exe
+
+# Test/sim scratch — keep `go test ./...` caches and temp stamps out of git
+/tmp/
+*.out
+*.prof
+
+# Editor/OS noise
+.DS_Store
+*.swp

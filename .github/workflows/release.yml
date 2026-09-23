@@ -1,0 +1,152 @@
+# release.yml — build & stamp asdf-tui with a real version, nothing more.
+#
+# The rule the whole file is built around: **without a command nothing is
+# pushed.** There is no `push` trigger on tags, no `schedule`, no auto-commit
+# back to the repo. The three paths are exactly the three arguments of
+# .github/scripts/next-version.sh (single source of truth — reproduce locally first):
+#
+#   pull_request        ->  build 1.2.3-alpha.<PR#>      artifact only
+#   workflow_dispatch   ->  build 1.2.3-{alpha|beta|rc}.<run#>   artifact only
+#   push on main        ->  build 1.2.4 + git tag + GitHub Release   (the merge)
+#
+# Every job that touches the version runs the same
+#   .github/scripts/next-version.sh for-...
+# the developer can run on their machine before pushing, so a reviewer can
+# check that CI stamp == the version the author previews locally.
+
+name: release
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: prerelease flavor for the manual artifact build
+        type: choice
+        default: rc
+        options: [alpha, beta, rc]
+  push:
+    branches: [main]
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from git
+        id: resolve
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request)
+              V="$(.github/scripts/next-version.sh for-pr "${{ github.event.pull_request.number }}")" ;;
+            workflow_dispatch)
+              V="$(.github/scripts/next-version.sh for-dispatch "${{ github.event.inputs.prerelease }}")" ;;
+            push)
+              V="$(.github/scripts/next-version.sh for-merge)" ;;
+          esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "resolved ${{ github.event_name }} -> $V"
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build and stamp version
+        id: build
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="dist/asdf-tui-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "$out" .
+          echo "name=$(basename "$out")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the stamped version
+        run: |
+          set -euo pipefail
+          got="$(./dist/asdf-tui-${{ needs.version.outputs.version }}-linux-amd64 version)"
+          want="asdf-tui ${{ needs.version.outputs.version }}"
+          [[ "$got" == "$want" ]] || {
+            echo "stamp mismatch: got '$got', want '$want'" >&2; exit 1
+          }
+          echo "verified: $got"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: dist/asdf-tui-*
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify version is not already tagged (idempotent re-run)
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "tag ${tag} already exists; nothing to publish."
+            echo "already=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build tagged artifact
+        if: env.already != '1'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="dist/asdf-tui-${VERSION}-linux-amd64"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" -o "$out" .
+          [[ "$(./$out version)" == "asdf-tui ${VERSION}" ]] \
+            || { echo "stamp mismatch" >&2; exit 1; }
+
+      - name: Create git tag and GitHub Release
+        if: env.already != '1'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          files: dist/asdf-tui-*
+          body: |
+            ## What's new
+            - Cross-compiled `asdf-tui` binaries with the version baked in —
+              `asdf-tui version` now prints exactly `${{ needs.version.outputs.version }}`.
+          generate_release_notes: true
