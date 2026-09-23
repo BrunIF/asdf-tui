@@ -138,7 +138,7 @@ jobs:
               [[ "$(./$out version)" == "asdf-tui ${VERSION}" ]] \
                 || { echo "stamp mismatch: $out" >&2; exit 1; }
             else
-              go version -m "$out" | grep -q "main.version=${VERSION}" \
+              strings "$out" | grep -qxF "${VERSION}" \
                 || { echo "stamp missing: $out" >&2; exit 1; }
             fi
           done
