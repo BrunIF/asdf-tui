@@ -800,3 +800,128 @@ func TestUpdateModalKeys(t *testing.T) {
 		t.Fatalf("update modal should announce latest and running version:\n%s", s)
 	}
 }
+
+// TestHeaderShowsVersion proves the program header carries the asdf-tui
+// version next to the app name (stamped by the release workflow, "dev" for
+// local builds).
+func TestHeaderShowsVersion(t *testing.T) {
+	old := version
+	version = "1.2.3"
+	defer func() { version = old }()
+
+	m := newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
+	m.width, m.height = 120, 30
+	s := stripANSI(m.View())
+	if !strings.Contains(s, "asdf-tui 1.2.3") {
+		t.Fatalf("header should show the program version next to the name:\n%s", s)
+	}
+}
+
+// TestCurrentVersionNextToName proves the middle column shows the tool's
+// currently-in-use version (the `*` line of `asdf list`) right after the
+// tool name once the state probe has answered.
+func TestCurrentVersionNextToName(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.state["nodejs"] = toolSt{added: true, versions: []string{"20.0.0", "18.0.0"}, current: "20.0.0", loaded: true}
+
+	block := stripANSI(m.renderToolInfo(60))
+	if got := strings.SplitN(block, "\n", 2)[0]; !strings.Contains(got, "nodejs") || !strings.Contains(got, "v20.0.0") {
+		t.Fatalf("name line should show the current version, got %q", got)
+	}
+
+	// not loaded yet → no version text
+	m.state["nodejs"] = toolSt{loaded: false}
+	if got := stripANSI(m.renderToolInfo(60)); strings.Contains(got, "v20.0.0") {
+		t.Fatalf("unloaded state must not show a version:\n%s", got)
+	}
+}
+
+// TestParseInstalledVersions proves the `asdf list` decoder separates
+// installed versions from the current one (the `*`-marked line), tolerates
+// "(set by …)" annotations and skips the "No versions installed" message.
+func TestParseInstalledVersions(t *testing.T) {
+	vs, cur := parseInstalledVersions("  18.0.0\n *20.0.0\n")
+	if len(vs) != 2 || vs[0] != "18.0.0" || vs[1] != "20.0.0" || cur != "20.0.0" {
+		t.Fatalf("basic: got %v current=%q", vs, cur)
+	}
+
+	vs, cur = parseInstalledVersions(" *20.0.0   (set by /home/u/.tool-versions)\n  18.0.0 (set by /p/.tool-versions)\n")
+	if len(vs) != 2 || vs[0] != "20.0.0" || vs[1] != "18.0.0" || cur != "20.0.0" {
+		t.Fatalf("annotated: got %v current=%q", vs, cur)
+	}
+
+	vs, cur = parseInstalledVersions("No versions installed\n")
+	if len(vs) != 0 || cur != "" {
+		t.Fatalf("empty: got %v current=%q", vs, cur)
+	}
+
+	vs, cur = parseInstalledVersions("")
+	if len(vs) != 0 || cur != "" {
+		t.Fatalf("blank: got %v current=%q", vs, cur)
+	}
+}
+
+// TestUninstallFlow proves the fifth action ("Uninstall a version…") opens
+// the right column on the installed versions, Enter on a row arms the y/n
+// confirmation (drawn over the list), n/Esc cancel without leaving, and y
+// schedules the `asdf uninstall` task.
+func TestUninstallFlow(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.state["nodejs"] = toolSt{added: true, versions: []string{"20.0.0", "18.0.0"}, current: "20.0.0", loaded: true}
+
+	out, _ := m.runAction(4)
+	m = asModel(t, out)
+	if m.mode != verUninstall || m.focus != focusVersions {
+		t.Fatalf("uninstall action should open the version list, mode=%d focus=%d", m.mode, m.focus)
+	}
+	if len(m.verItems) != 2 {
+		t.Fatalf("version list should carry the installed versions, got %v", m.verItems)
+	}
+
+	// Enter on the first (newest) version arms the confirmation
+	out, _ = m.versionsKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, out)
+	if m.confirmUninstall != "20.0.0" {
+		t.Fatalf("Enter should arm the confirmation on 20.0.0, got %q", m.confirmUninstall)
+	}
+	if s := m.renderVersions(30, 20); !strings.Contains(s, "Uninstall nodejs 20.0.0?") {
+		t.Fatalf("confirm view should ask about the version:\n%s", s)
+	}
+
+	// n cancels and stays in the list
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = asModel(t, out)
+	if m.confirmUninstall != "" || m.mode != verUninstall {
+		t.Fatalf("n should cancel the confirmation, got %q mode=%d", m.confirmUninstall, m.mode)
+	}
+
+	// re-arm and y runs the task (asdf is absent in tests → the task errors)
+	out, _ = m.versionsKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, out)
+	conf, cmd := m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = asModel(t, conf)
+	if !m.busy || cmd == nil {
+		t.Fatalf("y should mark busy and schedule the uninstall, busy=%v", m.busy)
+	}
+	msg, ok := cmd().(taskDoneMsg)
+	if !ok || !strings.HasPrefix(msg.label, "Uninstall nodejs 20.0.0") {
+		t.Fatalf("task label should name the tool and version, got %+v", msg)
+	}
+}
+
+// TestUninstallSuccessExitsList proves a successful uninstall task closes the
+// version list back to the actions column and clears the confirmation.
+func TestUninstallSuccessExitsList(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.state["nodejs"] = toolSt{added: true, versions: []string{"20.0.0", "18.0.0"}, loaded: true}
+	m.mode, m.focus, m.confirmUninstall = verUninstall, focusVersions, "18.0.0"
+
+	out, _ := m.Update(taskDoneMsg{label: "Uninstall nodejs 18.0.0"})
+	m = asModel(t, out)
+	if m.mode != verNone || m.focus != focusActions || m.confirmUninstall != "" {
+		t.Fatalf("successful uninstall should exit the list, mode=%d focus=%d confirm=%q", m.mode, m.focus, m.confirmUninstall)
+	}
+	if m.errMsg != "" || !strings.Contains(m.statusMsg, "done") {
+		t.Fatalf("success should report done, err=%q status=%q", m.errMsg, m.statusMsg)
+	}
+}
