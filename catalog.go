@@ -15,6 +15,9 @@ import (
 type Plugin struct {
 	Name string
 	Desc string
+	// AppDesc is a short, name-only description of the utility itself
+	// (curated, not re-derived from the forge), shown when available.
+	AppDesc string
 	Repo string
 	// Unavailable marks a plugin whose repository could not be reached
 	// during catalog refresh (network error, removed plugin, rate-limit).
@@ -74,6 +77,8 @@ func loadCatalogYAML(path string) ([]Plugin, error) {
 			cur.Removed = strings.TrimSpace(strings.TrimPrefix(t, "removed:")) == "true"
 		} else if strings.HasPrefix(t, "desc:") {
 			cur.Desc = yamlUnquote(strings.TrimSpace(strings.TrimPrefix(t, "desc:")))
+		} else if strings.HasPrefix(t, "app_desc:") {
+			cur.AppDesc = yamlUnquote(strings.TrimSpace(strings.TrimPrefix(t, "app_desc:")))
 		} else if strings.HasPrefix(t, "repo:") {
 			cur.Repo = yamlUnquote(strings.TrimSpace(strings.TrimPrefix(t, "repo:")))
 		} else if strings.HasPrefix(t, "project_desc:") {
@@ -112,6 +117,9 @@ func saveCatalogYAML(path string, plugins []Plugin) error {
 			b.WriteString("  removed: true\n")
 		}
 		b.WriteString("  desc: " + yamlScalar(p.Desc) + "\n")
+		if p.AppDesc != "" {
+			b.WriteString("  app_desc: " + yamlScalar(p.AppDesc) + "\n")
+		}
 		b.WriteString("  repo: " + yamlScalar(p.Repo) + "\n")
 		if p.ProjectDesc != "" {
 			b.WriteString("  project_desc: " + yamlScalar(p.ProjectDesc) + "\n")

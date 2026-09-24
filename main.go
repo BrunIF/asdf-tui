@@ -313,6 +313,10 @@ func mergeCatalogDiff(path string, fresh []Plugin, verified map[string]bool) ([]
 			// a plugin that is back in `asdf plugin list all` and reachable
 			// is no longer "removed"; unreachable rows keep their flag
 			f.Removed = old.Removed && f.Unavailable
+			// app_desc is curated data (a name-only utility description) and
+			// is never re-derived from the forge, so carry the known value
+			// over on every refresh.
+			f.AppDesc = old.AppDesc
 		}
 		out = append(out, f)
 	}

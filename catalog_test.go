@@ -103,6 +103,43 @@ func TestCatalogDiffMerge(t *testing.T) {
 	}
 }
 
+// TestMergeKeepsAppDesc proves catalog-refresh never erases the curated
+// name-only app description: it is carried over from the live row no matter
+// what the network walk put into desc/project/project_desc (verified or not).
+func TestMergeKeepsAppDesc(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugins.yaml")
+	before := []Plugin{{
+		Name:        "kubectl",
+		Repo:        "a/kubectl",
+		AppDesc:     "Kubernetes command-line client",
+		Desc:        "curated desc",
+		Project:     "https://github.com/kubernetes/kubectl",
+		ProjectDesc: "curated project desc",
+	}}
+	fresh := []Plugin{{
+		Name:        "kubectl",
+		Repo:        "a/kubectl",
+		Desc:        "network desc",
+		Project:     "https://github.com/kubernetes/kubectl",
+		ProjectDesc: "network project desc",
+	}}
+
+	if err := saveCatalogYAML(path, before); err != nil {
+		t.Fatalf("saveCatalogYAML: %v", err)
+	}
+	out, err := mergeCatalogDiff(path, fresh, map[string]bool{"kubectl": true})
+	if err != nil {
+		t.Fatalf("mergeCatalogDiff: %v", err)
+	}
+	if len(out) != 1 || out[0].AppDesc != "Kubernetes command-line client" {
+		t.Fatalf("app_desc must survive refresh, got %+v", out)
+	}
+	if out[0].Desc != "network desc" || out[0].ProjectDesc != "network project desc" {
+		t.Errorf("desc/project_desc come from the network on a verified walk: %+v", out[0])
+	}
+}
+
 // TestMergeKeepsArchived proves a README-only (rate-limited) walk does not
 // wipe a known archived flag and never flips 🔒 into 🗑: the plugin is back in
 // asdf (fresh, reachable) but its archive state was not re-confirmed by the

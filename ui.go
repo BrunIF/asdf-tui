@@ -205,6 +205,12 @@ type model struct {
 	// warnOpen shows the startup warning modal when the asdf version manager
 	// itself is missing — the tool depends on it for every action.
 	warnOpen bool
+	// updateOpen shows the "new version available" modal at startup;
+	// doUpdate records a confirmed upgrade so runTUI can hand the terminal
+	// to the installer.
+	updateOpen   bool
+	updateLatest string
+	doUpdate     bool
 }
 
 var (
@@ -269,7 +275,13 @@ func newModelCheck(plugins []Plugin, rootDir string, asdfOK bool) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, func() tea.Msg { return refreshMsg{} })
+	cmds := []tea.Cmd{m.spinner.Tick, func() tea.Msg { return refreshMsg{} }}
+	// Only stamped releases get the update check; "dev" builds have no semver
+	// to compare against, so they never hit the network.
+	if version != "dev" {
+		cmds = append(cmds, checkUpdateCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 func stCmd(name string) tea.Cmd {
@@ -431,6 +443,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, func() tea.Msg { return refreshMsg{} }
 
+	case updateCheckMsg:
+		if msg.err == nil && updateAvailable(version, msg.latest) {
+			m.updateLatest = msg.latest
+			m.updateOpen = true
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.keyMsg(msg)
 	}
@@ -474,6 +493,10 @@ func (m model) keyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.busy {
 		return m, nil
+	}
+
+	if m.updateOpen {
+		return m.updateModalKey(key)
 	}
 
 	if m.warnOpen {
@@ -525,7 +548,10 @@ func (m model) keyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.trackSelection(cmd)
 	}
-	if key == "r" {
+	// 'r' removes — but only when not actively typing into the search
+	// filter, otherwise the letter leaks into the remove confirmation while
+	// the user is looking for a plugin.
+	if key == "r" && m.tools.FilterInput.Value() == "" {
 		if m.selected() != nil {
 			m.confirmRm = true
 		}
@@ -616,11 +642,12 @@ func (m *model) syncToolItems() {
 }
 
 // rankPlugins searches a plugin subset by relevance. Every space-separated
-// token must match the name, project link, description or project description
-// of a plugin; the plugins score points per token from the most specific field
-// match (exact name > name prefix > name substring > project > project
-// description > description), plus a bonus when all tokens land in the name.
-// Results come back best-first so the most relevant plugin sits at the cursor.
+// token must match the name, project link, app description, project or plugin
+// description of a plugin; the plugins score points per token from the most
+// specific field match (exact name > name prefix > name substring > project >
+// project/app description > plugin description), plus a bonus when all tokens
+// land in the name. Results come back best-first so the most relevant plugin
+// sits at the cursor.
 func rankPlugins(plugins []Plugin, term string) []list.Rank {
 	if len(plugins) == 0 {
 		return nil
@@ -657,6 +684,7 @@ func pluginSearchScore(p Plugin, tokens []string) int {
 	name := strings.ToLower(p.Name)
 	project := strings.ToLower(p.Project)
 	projectDesc := strings.ToLower(p.ProjectDesc)
+	appDesc := strings.ToLower(p.AppDesc)
 	desc := strings.ToLower(p.Desc)
 	total := 0
 	allInName := true
@@ -672,6 +700,8 @@ func pluginSearchScore(p Plugin, tokens []string) int {
 		case strings.Contains(project, t):
 			tier = 3
 		case projectDesc != "" && strings.Contains(projectDesc, t):
+			tier = 2
+		case appDesc != "" && strings.Contains(appDesc, t):
 			tier = 2
 		case desc != "" && strings.Contains(desc, t):
 			tier = 1
@@ -866,6 +896,20 @@ func (m model) setFilter(f pluginFilter) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateModalKey handles the startup update prompt: y confirms and quits the
+// TUI so runTUI can hand the terminal to the installer; n/Esc dismisses and
+// the session keeps running.
+func (m model) updateModalKey(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "y", "Y", "enter":
+		m.doUpdate = true
+		return m, tea.Quit
+	case "n", "N", "esc", "q":
+		m.updateOpen = false
+	}
+	return m, nil
+}
+
 // filterModalKey handles keys while the ctrl+f filter chooser is open.
 func (m model) filterModalKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
@@ -931,11 +975,19 @@ func (m *model) versionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pickVer = ""
 		m.focus = focusActions
 	case "up", "k":
-		if m.verSel > 0 {
+		if m.mode == verScope {
+			if m.selScope > 0 {
+				m.selScope--
+			}
+		} else if m.verSel > 0 {
 			m.verSel--
 		}
 	case "down", "j":
-		if m.verSel < len(m.filteredVersions())-1 {
+		if m.mode == verScope {
+			if m.selScope < 1 {
+				m.selScope++
+			}
+		} else if m.verSel < len(m.filteredVersions())-1 {
 			m.verSel++
 		}
 	case "pgup":
@@ -967,6 +1019,9 @@ func (m *model) versionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		f := m.filteredVersions()
+		if m.mode == verScope {
+			return m.runSetScope()
+		}
 		if m.verSel < len(f) {
 			switch m.mode {
 			case verInstall:
@@ -980,11 +1035,6 @@ func (m *model) versionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "l", "L":
 		if m.mode == verInstall {
 			return m.runInstallLatest()
-		}
-	case "1", "2", "3":
-		if m.mode == verScope {
-			m.selScope = int(key[0] - '1')
-			return m.runSetScope()
 		}
 	default:
 		if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
@@ -1181,15 +1231,19 @@ func (m *model) runSetScope() (tea.Model, tea.Cmd) {
 	if p == nil || m.pickVer == "" {
 		return m, nil
 	}
-	scopes := []string{"user", "folder", "system"}
+	scopes := []string{"user", "folder"}
 	sc := scopes[m.selScope]
 	pick, name, dir := m.pickVer, p.Name, m.rootDir
+	return m.runSetDefaultTask(name, pick, sc, dir)
+}
+
+func (m *model) runSetDefaultTask(name, version, sc, dir string) (tea.Model, tea.Cmd) {
 	m.busy = true
-	m.busyLabel = "Setting default (" + sc + "): " + name + " = " + pick
+	m.busyLabel = "Setting default (" + sc + "): " + name + " = " + version
 	m.statusMsg = ""
 	m.errMsg = ""
 	return m, doTaskCmd("Set default ("+sc+") "+name, func() (string, error) {
-		return "", asdfSetVersion(name, pick, sc, dir)
+		return "", asdfSetVersion(name, version, sc, dir)
 	})
 }
 
@@ -1297,12 +1351,32 @@ func (m model) View() string {
 	footer := m.statusLine()
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 	switch {
+	case m.updateOpen:
+		screen = overlayBox(screen, m.renderUpdateModal(), m.width)
 	case m.warnOpen:
 		screen = overlayBox(screen, m.renderWarnModal(), m.width)
 	case m.filterOpen:
 		screen = overlayBox(screen, m.renderFilterModal(), m.width)
 	}
 	return screen
+}
+
+// renderUpdateModal draws the startup prompt shown when GitHub lists a newer
+// asdf-tui than the stamped build: opting in closes the TUI and lets the
+// installer take over the terminal.
+func (m model) renderUpdateModal() string {
+	var b strings.Builder
+	b.WriteString(styleBrand.Render(" ⬆ asdf-tui update available ") + "\n\n")
+	b.WriteString("New version " + m.updateLatest + " is out,\n")
+	b.WriteString("you are running " + version + ".\n\n")
+	b.WriteString("Install it now? The TUI exits and the\n")
+	b.WriteString("installer takes over this terminal.\n\n")
+	b.WriteString(styleDim.Render("y / Enter — install · n / Esc — stay"))
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("86")).
+		Padding(0, 1).
+		Render(b.String())
 }
 
 // renderWarnModal draws the startup warning shown when asdf itself is missing:
@@ -1371,9 +1445,10 @@ func (m model) renderActions(w, h int) string {
 			"\n\n  " + styleOk.Render("y") + " yes    " + styleDim.Render("n") + " no"
 	}
 	var b strings.Builder
-	// fixed-height info block: name, desc, repo status, plugin + project links.
-	// It always occupies the same number of lines so the actions below never
-	// jump when the description or links change.
+	// fixed-height info block: name, app description, repo status, plugin +
+	// project descriptions with their links. It always occupies the same
+	// number of lines so the actions below never jump when the description or
+	// links change.
 	b.WriteString(m.renderToolInfo(w))
 	labels := []string{
 		"Install a specific version…",
@@ -1398,20 +1473,26 @@ func (m model) renderActions(w, h int) string {
 }
 
 // renderToolInfo prints the selected tool's header block on a fixed number of
-// lines (name, status, plugin description, plugin repo link, project/upstream
-// description, project link, blank separator) so the action list below keeps
-// a stable offset. The two descriptions are deliberately on distinct lines
-// (the project one is indented behind a "—" dash) so they never merge.
+// lines (name, name-only app description, repo status, plugin description,
+// plugin repo link, project description, project link, blank separator) so the
+// action list below keeps a stable offset. The two descriptions are
+// deliberately on distinct lines so they never merge.
 func (m model) renderToolInfo(w int) string {
 	var b strings.Builder
 	p := m.selected()
 	if p == nil {
 		b.WriteString(styleDim.Render("choose a tool in the left column"))
-		b.WriteString("\n\n\n\n\n\n")
+		b.WriteString("\n\n\n\n\n\n\n\n\n\n")
 		return b.String()
 	}
 	b.WriteString(styleBrand.Render(p.Name+pluginIcon(*p)) + "\n")
+	if ad := firstLine(p.AppDesc); ad != "" {
+		b.WriteString(styleDim.Render(ad) + "\n")
+	} else {
+		b.WriteString("\n")
+	}
 	b.WriteString(m.repoStatusLine(*p) + "\n")
+	b.WriteString("\n")
 	desc := firstLine(p.Desc)
 	if desc == "" {
 		b.WriteString(styleDim.Render("—") + "\n")
@@ -1419,17 +1500,18 @@ func (m model) renderToolInfo(w int) string {
 		b.WriteString(styleDim.Render(desc) + "\n")
 	}
 	if p.Repo != "" {
-		b.WriteString(styleDim.Render("plugin: "+p.Repo) + "\n")
+		b.WriteString(styleDim.Render("🔌 "+p.Repo) + "\n")
 	} else {
 		b.WriteString("\n")
 	}
+	b.WriteString("\n")
 	if pd := firstLine(p.ProjectDesc); pd != "" {
-		b.WriteString(styleDim.Render("  — "+pd) + "\n")
+		b.WriteString(styleDim.Render(pd) + "\n")
 	} else {
 		b.WriteString("\n")
 	}
 	if p.Project != "" {
-		b.WriteString(styleDim.Render("project: "+p.Project) + "\n")
+		b.WriteString(styleDim.Render("↗ "+p.Project) + "\n")
 	} else {
 		b.WriteString("\n")
 	}
@@ -1572,8 +1654,7 @@ func (m model) renderScope(w, h int) string {
 	}
 	items := []string{
 		"user   — ~/.tool-versions (asdf set -u)",
-		"folder — ./.tool-versions (asdf set -p)",
-		"system — /etc/asdf/tool-versions (root)",
+		"folder — ./.tool-versions (asdf set)",
 	}
 	var b strings.Builder
 	b.WriteString(styleDim.Render("set default") + "  " + styleBrand.Render(name+" "+m.pickVer) + "\n\n")
@@ -1584,7 +1665,7 @@ func (m model) renderScope(w, h int) string {
 			b.WriteString("  " + it + "\n\n")
 		}
 	}
-	b.WriteString(styleDim.Render("1 / 2 / 3 — pick, then Enter"))
+	b.WriteString(styleDim.Render("↑ / ↓ — pick, then Enter"))
 	return b.String()
 }
 
@@ -1597,14 +1678,14 @@ func (m model) statusLine() string {
 		b.WriteString(styleDim.Render(" ↑/↓ · j/k · 1-8 pick · Enter run · Esc back to tools") + "\n")
 	case m.focus == focusVersions:
 		if m.mode == verScope {
-			b.WriteString(styleDim.Render(" Enter run · Esc back") + "\n")
+			b.WriteString(styleDim.Render(" ↑/↓ pick · Enter run · Esc back") + "\n")
 		} else {
 			b.WriteString(styleDim.Render(" Enter install · L latest · / letters filter · PgUp/PgDn pages · Esc clear/back") + "\n")
 		}
 	case m.confirmRm:
 		b.WriteString(styleDim.Render(" y — confirm removal · n — cancel") + "\n")
 	default:
-		b.WriteString(styleDim.Render(" type to search · ctrl+f filter · Enter actions · r remove · q quit") + "\n")
+		b.WriteString(styleDim.Render(" type to search names, apps, urls · ↑/↓ move · Enter pick · Esc clear filter") + "\n")
 	}
 	if m.errMsg != "" {
 		b.WriteString(styleErr.Render(" ✗ "+m.errMsg) + "\n")
@@ -1630,8 +1711,15 @@ func pad(s string, w int) string {
 func runTUI(plugins []Plugin, rootDir string) {
 	m := newModel(plugins, rootDir)
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	final, err := p.Run()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
+	}
+	if wantsUpdate(final) {
+		// The TUI has fully restored the terminal here, so the installer can
+		// print and prompt normally.
+		runInstaller()
+		os.Exit(0)
 	}
 }

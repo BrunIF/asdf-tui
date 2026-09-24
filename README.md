@@ -134,12 +134,11 @@ and every line has its own slot, the action list below never jumps. `↑/↓`,
 `Esc` clears it (or walks back through the columns: versions → actions →
 tools). `Enter` runs the chosen action.
 
-Setting a default offers three scopes (`1/2/3`, then `Enter`):
+Setting a default offers two scopes (pick with `↑/↓`, confirm with `Enter`):
 
 - **user** — `~/.tool-versions` (`asdf set -u`, legacy `asdf global`)
-- **folder** — `./.tool-versions` (`asdf set -p`, legacy `asdf local`;
-  the file is created when missing)
-- **system** — `/etc/asdf/tool-versions` (via `sudo` when not writable)
+- **folder** — `./.tool-versions` (`asdf set`; the file is created in the
+  working directory when missing)
 
 `asdf` ≥ 0.16 is auto-detected (`asdf set -u/-p`, `asdf list all`); older
 versions fall back to `global`/`local`/`list-all`.
