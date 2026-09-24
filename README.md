@@ -144,8 +144,12 @@ Setting a default offers two scopes (pick with `↑/↓`, confirm with `Enter`):
 - **folder** — `./.tool-versions` (`asdf set`; the file is created in the
   working directory when missing)
 
-`asdf` ≥ 0.16 is auto-detected (`asdf set -u/-p`, `asdf list all`); older
-versions fall back to `global`/`local`/`list-all`.
+`asdf` ≥ 0.16 is auto-detected and uses the modern scoping/listing commands
+(`asdf set -u` for user scope, `asdf set` for the folder file, plus `asdf list
+all`); detection reads both the legacy (`version: 0.16.2`) and the newer
+(`0.20.2 (revision unknown)`) `asdf version` formats. Newer asdf releases have
+removed the legacy `global`/`local`/`list-all` commands, so the modern syntax
+is effectively required there.
 
 ## Layout
 
