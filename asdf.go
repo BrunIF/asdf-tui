@@ -45,13 +45,12 @@ func runCmdDir(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(out.String()), err
 }
 
-var asdfVerRe = regexp.MustCompile(`version:\s*([0-9]+)\.([0-9]+)`)
+// asdfVerRe matches the major.minor anywhere in `asdf version` output.
+// The format changed over time: "version: 0.16.2" (pre-0.17) and plain
+// "0.20.2 (revision unknown)" (0.17+, as shipped by Homebrew).
+var asdfVerRe = regexp.MustCompile(`([0-9]+)\.([0-9]+)`)
 
-func asdfUsesSet() bool {
-	out, err := runCmd("version")
-	if err != nil {
-		return false
-	}
+func asdfVersionUsesSet(out string) bool {
 	m := asdfVerRe.FindStringSubmatch(out)
 	if m == nil {
 		return false
@@ -59,6 +58,14 @@ func asdfUsesSet() bool {
 	maj, _ := strconv.Atoi(m[1])
 	min, _ := strconv.Atoi(m[2])
 	return maj >= 1 || (maj == 0 && min >= 16)
+}
+
+func asdfUsesSet() bool {
+	out, err := runCmd("version")
+	if err != nil {
+		return false
+	}
+	return asdfVersionUsesSet(out)
 }
 
 func asdfPluginList() []string {

@@ -666,6 +666,25 @@ func TestAsdfInstalled(t *testing.T) {
 	}
 }
 
+// TestAsdfVersionUsesSet proves the version probe recognizes both the legacy
+// "version: 0.16.2" output and the plain "0.20.2 (revision unknown)" output
+// that 0.17+ (Homebrew) prints — asdfUsesSet must stay true on the latter,
+// otherwise the app falls back to the removed list-all/global commands.
+func TestAsdfVersionUsesSet(t *testing.T) {
+	cases := map[string]bool{
+		"version: 0.16.2":           true,
+		"v0.16.2":                   true,
+		"0.20.2 (revision unknown)": true,
+		"0.15.1":                    false,
+		"nonsense":                  false,
+	}
+	for out, want := range cases {
+		if got := asdfVersionUsesSet(out); got != want {
+			t.Errorf("asdfVersionUsesSet(%q) = %v, want %v", out, got, want)
+		}
+	}
+}
+
 // TestWarnModal proves the startup warning opens when asdf is missing, other
 // keys are swallowed while it is up, and Enter dismisses it (never quits).
 func TestWarnModal(t *testing.T) {
