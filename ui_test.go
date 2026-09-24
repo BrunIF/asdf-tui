@@ -660,3 +660,77 @@ func TestNoWarnWhenAsdfPresent(t *testing.T) {
 		t.Fatal("present asdf must not open the warning modal")
 	}
 }
+
+// asModel normalizes the two shapes tea hands back after Update (value or
+// pointer receiver) so tests can inspect fields directly.
+func asModel(t *testing.T, tm tea.Model) model {
+	t.Helper()
+	switch m := tm.(type) {
+	case model:
+		return m
+	case *model:
+		return *m
+	}
+	t.Fatalf("unexpected model type %T", tm)
+	return model{}
+}
+
+// TestUpdateAvailable proves the update gate: a newer published tag prompts,
+// an equal/older one does not, and local "dev" builds never nag.
+func TestUpdateAvailable(t *testing.T) {
+	if !updateAvailable("0.1.1", "0.2.0") {
+		t.Error("0.2.0 must update over 0.1.1")
+	}
+	if !updateAvailable("0.1.1", "0.1.2") {
+		t.Error("patch bump must update")
+	}
+	if updateAvailable("0.1.1", "0.1.1") {
+		t.Error("equal version must not update")
+	}
+	if updateAvailable("0.2.0", "0.1.0") {
+		t.Error("older published tag must not update")
+	}
+	if updateAvailable("dev", "0.2.0") {
+		t.Error("dev builds must skip the check")
+	}
+	if updateAvailable("", "0.2.0") {
+		t.Error("empty current version must skip the check")
+	}
+	if updateAvailable("0.1.1", "") {
+		t.Error("empty latest version must skip the check")
+	}
+}
+
+// TestUpdateModalKeys proves y quits with the upgrade flag set (the quit cmd
+// actually yields tea.QuitMsg), n dismisses without quitting, and the render
+// announces the published version.
+func TestUpdateModalKeys(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
+	m.updateOpen, m.updateLatest = true, "0.2.0"
+
+	out, cmd := m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	got := asModel(t, out)
+	if !got.doUpdate || cmd == nil {
+		t.Fatal("y must set doUpdate and return tea.Quit")
+	}
+	switch cmd().(type) {
+	case tea.QuitMsg:
+	default:
+		t.Fatalf("y must return tea.Quit, got %T", cmd())
+	}
+
+	m = newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
+	m.updateOpen, m.updateLatest = true, "0.2.0"
+	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyEsc})
+	got = asModel(t, out)
+	if got.updateOpen || got.doUpdate || cmd != nil {
+		t.Fatal("Esc must dismiss the prompt without quitting")
+	}
+
+	m = newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
+	m.updateOpen, m.updateLatest = true, "0.2.0"
+	s := m.renderUpdateModal()
+	if !strings.Contains(s, "0.2.0") || !strings.Contains(s, version) {
+		t.Fatalf("update modal should announce latest and running version:\n%s", s)
+	}
+}
