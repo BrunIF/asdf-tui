@@ -29,6 +29,7 @@ const (
 	verInstall
 	verSet
 	verScope
+	verUninstall
 )
 
 // pluginFilter narrows the tools column to a subset of the catalog, switched
@@ -62,7 +63,10 @@ var filterOptions = []struct {
 type toolSt struct {
 	added    bool
 	versions []string
-	loaded   bool
+	// current is the version of the tool currently in use, as marked by
+	// `asdf list` (its `*` line); "" when none is set.
+	current string
+	loaded  bool
 }
 
 type pluginItem struct {
@@ -176,32 +180,35 @@ type pluginRefreshMsg struct {
 type refreshMsg struct{}
 
 type model struct {
-	plugins    []Plugin
-	tools      list.Model
-	state      map[string]toolSt
-	addedSet   map[string]bool
-	focus      focus
-	selAct     int
-	selScope   int
-	mode       verMode
-	verItems   []string
-	verFilter  string
-	verSel     int
-	verTop     int
-	pickVer    string
-	confirmRm  bool
-	busy       bool
-	busyLabel  string
-	spinner    spinner.Model
-	statusMsg  string
-	errMsg     string
-	width      int
-	height     int
-	lastSel    string
-	rootDir    string
-	filter     pluginFilter
-	filterOpen bool
-	filterSel  int
+	plugins   []Plugin
+	tools     list.Model
+	state     map[string]toolSt
+	addedSet  map[string]bool
+	focus     focus
+	selAct    int
+	selScope  int
+	mode      verMode
+	verItems  []string
+	verFilter string
+	verSel    int
+	verTop    int
+	pickVer   string
+	confirmRm bool
+	// confirmUninstall holds the installed version awaiting a y/n before the
+	// "Uninstall a version…" action removes it (version list, right column).
+	confirmUninstall string
+	busy             bool
+	busyLabel        string
+	spinner          spinner.Model
+	statusMsg        string
+	errMsg           string
+	width            int
+	height           int
+	lastSel          string
+	rootDir          string
+	filter           pluginFilter
+	filterOpen       bool
+	filterSel        int
 	// warnOpen shows the startup warning modal when the asdf version manager
 	// itself is missing — the tool depends on it for every action.
 	warnOpen bool
@@ -289,7 +296,7 @@ func stCmd(name string) tea.Cmd {
 		st := toolSt{}
 		if asdfIsAdded(name) {
 			st.added = true
-			st.versions = toolInstalledVersions(name)
+			st.versions, st.current = toolInstalledVersions(name)
 		}
 		st.loaded = true
 		return statusMsg{name: name, st: st}
@@ -433,6 +440,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = verNone
 				m.focus = focusActions
 			}
+			if strings.HasPrefix(msg.label, "Uninstall") {
+				m.confirmUninstall = ""
+				m.mode = verNone
+				m.focus = focusActions
+			}
 		}
 		// refresh both the plugin list and the currently selected tool's
 		// installed/available versions so the middle column + set-default
@@ -517,6 +529,16 @@ func (m model) keyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.runRemove()
 		case "n", "N", "esc":
 			m.confirmRm = false
+		}
+		return m, nil
+	}
+
+	if m.confirmUninstall != "" {
+		switch key {
+		case "y", "Y":
+			return m.runUninstall(m.confirmUninstall)
+		case "n", "N", "esc", "q":
+			m.confirmUninstall = ""
 		}
 		return m, nil
 	}
@@ -943,10 +965,10 @@ func (m *model) actionsKey(key string) (tea.Model, tea.Cmd) {
 			m.selAct--
 		}
 	case "down", "j":
-		if m.selAct < 7 {
+		if m.selAct < 8 {
 			m.selAct++
 		}
-	case "1", "2", "3", "4", "5", "6", "7", "8":
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		m.selAct = int(key[0] - '1')
 	case "enter", " ":
 		return m.runAction(m.selAct)
@@ -1030,6 +1052,8 @@ func (m *model) versionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.pickVer = f[m.verSel]
 				m.mode = verScope
 				m.selScope = 0
+			case verUninstall:
+				m.confirmUninstall = f[m.verSel]
 			}
 		}
 	case "l", "L":
@@ -1264,6 +1288,25 @@ func (m *model) runRemove() (tea.Model, tea.Cmd) {
 	})
 }
 
+// runUninstall removes one installed version of the selected tool after the
+// user confirmed it in the versions column (`asdf uninstall <name> <version>`).
+func (m *model) runUninstall(ver string) (tea.Model, tea.Cmd) {
+	p := m.selected()
+	if p == nil {
+		m.confirmUninstall = ""
+		return m, nil
+	}
+	name := p.Name
+	m.confirmUninstall = ""
+	m.busy = true
+	m.busyLabel = "Uninstalling " + name + " " + ver
+	m.statusMsg = ""
+	m.errMsg = ""
+	return m, doTaskCmd("Uninstall "+name+" "+ver, func() (string, error) {
+		return "", asdfUninstall(name, ver)
+	})
+}
+
 func (m *model) runAction(i int) (tea.Model, tea.Cmd) {
 	p := m.selected()
 	if p == nil {
@@ -1291,26 +1334,38 @@ func (m *model) runAction(i int) (tea.Model, tea.Cmd) {
 		m.errMsg = ""
 		m.focus = focusVersions
 	case 4:
+		st, ok := m.state[p.Name]
+		if !ok || !st.loaded || len(st.versions) == 0 {
+			m.errMsg = "no installed versions yet — install one first, then uninstall"
+			return m, nil
+		}
+		m.verItems = st.versions
+		m.verFilter = ""
+		m.verSel, m.verTop = 0, 0
+		m.mode = verUninstall
+		m.errMsg = ""
+		m.focus = focusVersions
+	case 5:
 		name := p.Name
 		m.busy = true
 		m.busyLabel = "Updating plugin " + name
 		return m, doTaskCmd("Update "+name, func() (string, error) {
 			return "", asdfUpdatePlugin(name)
 		})
-	case 5:
+	case 6:
 		name := p.Name
 		m.busy = true
 		m.busyLabel = "Reshim " + name
 		return m, doTaskCmd("Reshim "+name, func() (string, error) {
 			return "", asdfReshim(name)
 		})
-	case 6:
+	case 7:
 		m.busy = true
 		m.busyLabel = "Refreshing " + p.Name
 		m.statusMsg = ""
 		m.errMsg = ""
 		return m, refreshPluginCmd(*p)
-	case 7:
+	case 8:
 		m.confirmRm = true
 	}
 	return m, nil
@@ -1344,7 +1399,7 @@ func (m model) View() string {
 	body := lipgloss.JoinHorizontal(lipgloss.Top, left, middle, right)
 
 	header := lipgloss.JoinHorizontal(lipgloss.Left,
-		styleBrand.Render(" asdf-tui "),
+		styleBrand.Render(" asdf-tui ")+styleDim.Render(version+" "),
 		styleDim.Render(m.headerHints()),
 	)
 
@@ -1419,6 +1474,8 @@ func verModeName(v verMode) string {
 		return "choose installed version"
 	case verScope:
 		return "choose scope"
+	case verUninstall:
+		return "remove an installed version"
 	}
 	return ""
 }
@@ -1455,6 +1512,7 @@ func (m model) renderActions(w, h int) string {
 		"Install latest version",
 		"Add plugin",
 		"Set default version…",
+		"Uninstall a version…",
 		"Update plugin",
 		"Reshim",
 		"Refresh plugin info",
@@ -1485,7 +1543,7 @@ func (m model) renderToolInfo(w int) string {
 		b.WriteString("\n\n\n\n\n\n\n\n\n\n")
 		return b.String()
 	}
-	b.WriteString(styleBrand.Render(p.Name+pluginIcon(*p)) + "\n")
+	b.WriteString(styleBrand.Render(p.Name+pluginIcon(*p)) + m.currentVersionLine(p.Name) + "\n")
 	if ad := firstLine(p.AppDesc); ad != "" {
 		b.WriteString(styleDim.Render(ad) + "\n")
 	} else {
@@ -1517,6 +1575,18 @@ func (m model) renderToolInfo(w int) string {
 	}
 	b.WriteString("\n")
 	return b.String()
+}
+
+// currentVersionLine renders the version of the tool currently in use (from
+// the `*` line of `asdf list`), dimmed right after the tool name in the
+// middle column; "" when the state probe has not answered yet or no version
+// is set.
+func (m model) currentVersionLine(name string) string {
+	st, ok := m.state[name]
+	if !ok || !st.loaded || st.current == "" {
+		return ""
+	}
+	return "  " + styleDim.Render("v"+st.current)
 }
 
 // repoStatusLine combines the repository state (archived/removed/unreachable/
@@ -1557,7 +1627,7 @@ func (m model) renderRight(w, h int) string {
 	if m.busy {
 		return m.spinner.View() + "  " + m.busyLabel
 	}
-	if m.mode == verInstall || m.mode == verSet {
+	if m.mode == verInstall || m.mode == verSet || m.mode == verUninstall {
 		return m.renderVersions(w, h)
 	}
 	if m.mode == verScope {
@@ -1586,10 +1656,24 @@ func (m model) renderRight(w, h int) string {
 }
 
 func (m model) renderVersions(w, h int) string {
+	if m.confirmUninstall != "" {
+		name := "..."
+		if p := m.selected(); p != nil {
+			name = p.Name
+		}
+		var b strings.Builder
+		b.WriteString(styleErr.Render("Uninstall "+name+" "+m.confirmUninstall+"?") + "\n")
+		b.WriteString(styleDim.Render("removes the installed version") + "\n\n")
+		b.WriteString("  " + styleOk.Render("y") + " yes    " + styleDim.Render("n") + " no")
+		return b.String()
+	}
 	var b strings.Builder
 	title := "install a version"
-	if m.mode == verSet {
+	switch m.mode {
+	case verSet:
 		title = "installed versions → pick, then scope"
+	case verUninstall:
+		title = "installed versions → pick, then remove"
 	}
 	b.WriteString(styleDim.Render(title) + "\n")
 	b.WriteString(styleDim.Render("> "+m.verFilter+" ") + "\n\n")
@@ -1674,11 +1758,15 @@ func (m model) statusLine() string {
 	switch {
 	case m.busy:
 		b.WriteString(styleBrand.Render(" running: ") + m.busyLabel + "\n")
+	case m.confirmUninstall != "":
+		b.WriteString(styleDim.Render(" y — confirm uninstall · n — cancel") + "\n")
 	case m.focus == focusActions && !m.confirmRm:
-		b.WriteString(styleDim.Render(" ↑/↓ · j/k · 1-8 pick · Enter run · Esc back to tools") + "\n")
+		b.WriteString(styleDim.Render(" ↑/↓ · j/k · 1-9 pick · Enter run · Esc back to tools") + "\n")
 	case m.focus == focusVersions:
 		if m.mode == verScope {
 			b.WriteString(styleDim.Render(" ↑/↓ pick · Enter run · Esc back") + "\n")
+		} else if m.mode == verUninstall {
+			b.WriteString(styleDim.Render(" Enter uninstall · / letters filter · PgUp/PgDn pages · Esc clear/back") + "\n")
 		} else {
 			b.WriteString(styleDim.Render(" Enter install · L latest · / letters filter · PgUp/PgDn pages · Esc clear/back") + "\n")
 		}

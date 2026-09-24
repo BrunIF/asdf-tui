@@ -86,6 +86,9 @@ stays paced and anonymous.
 
 ## TUI columns and keys
 
+The header shows the running asdf-tui version next to the app name (`dev` for
+hand-built binaries, the stamped release version otherwise).
+
 **Left column — tools catalog.** Just start typing; the list filters live.
 `↑/↓`, `j/k` navigate. `r` remove (asks for confirmation). `q` quits (when the
 search field is empty); `Esc` clears the search. `Enter` moves to the actions
@@ -114,13 +117,14 @@ with cell-accurate widths, so box-drawing borders and emoji icons are never
 split.
 
 **Middle column — tool details + actions.** A fixed-height block on top always
-shows, in order: the name, the repository status (active/archived/removed/
-unreachable plus whether the plugin is added to asdf), the plugin's one-line
-description, the plugin repo link, the upstream project's description (collected
-from the project's forge API; indented behind a `—` so the two descriptions
-never merge), and the upstream project link. Because the block is fixed-size
-and every line has its own slot, the action list below never jumps. `↑/↓`,
-`j/k`, `1`–`8` select; `Enter` runs; `Esc` returns to the tools column.
+shows, in order: the name (with the currently-in-use version, dimmed, when the
+plugin is added and a version is set), the repository status (active/archived/
+removed/unreachable plus whether the plugin is added to asdf), the plugin's
+one-line description, the plugin repo link, the upstream project's description
+(collected from the project's forge API; indented behind a `—` so the two
+descriptions never merge), and the upstream project link. Because the block is
+fixed-size and every line has its own slot, the action list below never jumps.
+`↑/↓`, `j/k`, `1`–`9` select; `Enter` runs; `Esc` returns to the tools column.
 
 | # | Action |
 | - | ------ |
@@ -128,15 +132,17 @@ and every line has its own slot, the action list below never jumps. `↑/↓`,
 | 2 | Install the latest stable version |
 | 3 | Add plugin — `asdf plugin add NAME [REPO]` (needed before the version list can be fetched) |
 | 4 | Set a default version — pick an **installed** version, then a scope |
-| 5 | Update the plugin |
-| 6 | Reshim |
-| 7 | Refresh plugin info — re-fetch desc/archived/project for this plugin (same rate-limit → README fallback as `catalog-refresh`) and save to the YAML catalog |
-| 8 | Remove the plugin (with confirmation) |
+| 5 | Uninstall a version — pick an **installed** version, confirm with `y` |
+| 6 | Update the plugin |
+| 7 | Reshim |
+| 8 | Refresh plugin info — re-fetch desc/archived/project for this plugin (same rate-limit → README fallback as `catalog-refresh`) and save to the YAML catalog |
+| 9 | Remove the plugin (with confirmation) |
 
 **Right column — versions.** `↑/↓`, `j/k` navigate, `PgUp/PgDn` turn pages
 (●/· indicator under the list). Letters filter live; `/` restarts the filter,
 `Esc` clears it (or walks back through the columns: versions → actions →
-tools). `Enter` runs the chosen action.
+tools). `Enter` runs the chosen action; uninstall asks a `y`/`n` confirmation
+first.
 
 Setting a default offers two scopes (pick with `↑/↓`, confirm with `Enter`):
 

@@ -83,20 +83,43 @@ func asdfPluginList() []string {
 	return res
 }
 
-func toolInstalledVersions(name string) []string {
+// toolInstalledVersions returns the installed versions of an asdf tool
+// (`asdf list <name>`) plus the one currently in use. asdf marks the active
+// version with a `*` prefix and may annotate it (e.g. "(set by …)"), so the
+// two are decoded together by parseInstalledVersions.
+func toolInstalledVersions(name string) (versions []string, current string) {
 	out, err := runCmd("list", name)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
-	var res []string
+	return parseInstalledVersions(out)
+}
+
+// parseInstalledVersions splits `asdf list <name>` output into the installed
+// versions and the current one (the line prefixed with `*`). Blank lines and
+// the "No versions installed" message are skipped; any "(set by …)" style
+// annotation after a version is dropped so only the raw version remains.
+func parseInstalledVersions(out string) (versions []string, current string) {
 	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
-		line := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(sc.Text()), "*"))
-		if line != "" && !strings.EqualFold(line, "No versions installed") {
-			res = append(res, line)
+		trimmed := strings.TrimSpace(sc.Text())
+		if trimmed == "" || strings.EqualFold(trimmed, "No versions installed") {
+			continue
+		}
+		starred := strings.HasPrefix(trimmed, "*")
+		t := strings.TrimSpace(strings.TrimPrefix(trimmed, "*"))
+		if i := strings.IndexAny(t, " \t"); i >= 0 {
+			t = t[:i]
+		}
+		if t == "" {
+			continue
+		}
+		versions = append(versions, t)
+		if starred && current == "" {
+			current = t
 		}
 	}
-	return res
+	return versions, current
 }
 
 func toolAllVersions(name string) ([]string, error) {
@@ -173,6 +196,11 @@ func asdfInstall(name, version, repo string) error {
 		return err
 	}
 	_, err := runCmd("install", name, version)
+	return err
+}
+
+func asdfUninstall(name, version string) error {
+	_, err := runCmd("uninstall", name, version)
 	return err
 }
 

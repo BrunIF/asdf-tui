@@ -303,8 +303,9 @@ func TestRefreshOnePluginParseError(t *testing.T) {
 }
 
 // TestRefreshActionWiring proves the "Refresh plugin info" action sits at
-// index 6 (key 7, before Remove plugin at index 7) and that running it
-// schedules a background command instead of blocking.
+// index 7 (key 8) and that running it schedules a background command instead
+// of blocking; "Remove plugin" moved to index 8 (key 9) when the uninstall
+// action was added.
 func TestRefreshActionWiring(t *testing.T) {
 	m := newModelCheck([]Plugin{{Name: "abc", Repo: "https://github.com/x/y.git"}}, "/tmp", true)
 	out := m.renderActions(40, 20)
@@ -315,7 +316,7 @@ func TestRefreshActionWiring(t *testing.T) {
 		t.Fatalf("Refresh should come before Remove:\n%s", out)
 	}
 
-	sm, cmd := m.runAction(6)
+	sm, cmd := m.runAction(7)
 	if cmd == nil {
 		t.Fatal("refresh action should schedule a command")
 	}
@@ -323,9 +324,9 @@ func TestRefreshActionWiring(t *testing.T) {
 		t.Fatalf("refresh action should mark the TUI busy")
 	}
 
-	boom, _ := m.runAction(7)
+	boom, _ := m.runAction(8)
 	if del, ok := boom.(*model); !ok || !del.confirmRm {
-		t.Fatal("action 7 should trigger the remove confirmation")
+		t.Fatal("action 8 should trigger the remove confirmation")
 	}
 }
 

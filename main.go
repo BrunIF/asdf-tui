@@ -364,7 +364,8 @@ func cmdList() {
 	}
 	for _, p := range plugins {
 		fmt.Printf("  • %s\n", p)
-		for _, v := range toolInstalledVersions(p) {
+		versions, _ := toolInstalledVersions(p)
+		for _, v := range versions {
 			fmt.Printf("      %s\n", v)
 		}
 	}
