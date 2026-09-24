@@ -8,6 +8,10 @@ Type to search the catalog **fzf-style** (live match on name, project link,
 description and project description, ranked — name matches surface first), then
 cascade through **three columns**: tools → actions → versions.
 
+<p align="center">
+  <img src="docs/asdf-tui-demo.gif" alt="asdf-tui screencast" width="720">
+</p>
+
 ## Installation
 
 The easiest way — one command, no manual steps, the script detects your OS
