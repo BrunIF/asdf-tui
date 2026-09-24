@@ -174,7 +174,7 @@ func asdfReshim(name string) error {
 	return err
 }
 
-func asdfSetVersion(name, version, scope string, dir string) error {
+func asdfSetVersion(name, version, scope, dir string) error {
 	switch scope {
 	case "user":
 		if asdfUsesSet() {
@@ -186,85 +186,25 @@ func asdfSetVersion(name, version, scope string, dir string) error {
 	case "folder":
 		if asdfUsesSet() {
 			ensureFolderVersionFile(dir)
-			_, err := runCmdDir(dir, "set", "-p", name, version)
+			// plain `asdf set` (no -p) targets the working-directory file we
+			// just ensured; --parent skips the cwd and walks up instead.
+			_, err := runCmdDir(dir, "set", name, version)
 			return err
 		}
 		_, err := runCmdDir(dir, "local", name, version)
 		return err
-	case "system":
-		return asdfSetSystem(name, version)
 	}
 	return fmt.Errorf("unknown scope: %s", scope)
 }
 
 func ensureFolderVersionFile(dir string) {
-	for d := dir; ; d = filepath.Dir(d) {
-		if d == string(filepath.Separator) {
-			break
-		}
-		if _, err := os.Stat(filepath.Join(d, ".tool-versions")); err == nil {
-			return
-		}
+	if _, err := os.Stat(filepath.Join(dir, ".tool-versions")); err == nil {
+		return
 	}
 	f, err := os.Create(filepath.Join(dir, ".tool-versions"))
 	if err == nil {
 		f.Close()
 	}
-}
-
-func asdfSetSystem(name, version string) error {
-	file := "/etc/asdf/tool-versions"
-	tmp, err := os.CreateTemp("", "asdf-tui-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-
-	src, _ := os.ReadFile(file)
-	keep := make([]string, 0)
-	for _, line := range strings.Split(string(src), "\n") {
-		if line == "" || strings.HasPrefix(line, name+" ") {
-			continue
-		}
-		keep = append(keep, line)
-	}
-	keep = append(keep, name+" "+version)
-	var buf bytes.Buffer
-	for i, l := range keep {
-		buf.WriteString(l)
-		if i != len(keep)-1 {
-			buf.WriteString("\n")
-		}
-	}
-	if err := os.WriteFile(tmp.Name(), buf.Bytes(), 0o644); err != nil {
-		return err
-	}
-
-	st, err := os.Stat(file)
-	writable := false
-	if err == nil {
-		writable = st.Mode().Perm()&0o200 != 0
-	} else {
-		info, ierr := os.Stat("/etc")
-		writable = ierr == nil && info.Mode().Perm()&0o200 != 0
-	}
-	if writable {
-		if err := os.Rename(tmp.Name(), file); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	tmpPath := tmp.Name()
-	tmp.Close()
-	cmd := exec.Command("sudo", "cp", tmpPath, file)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-	_ = os.Remove(tmpPath)
-	return nil
 }
 
 func asdfPluginListAll() ([]Plugin, error) {
