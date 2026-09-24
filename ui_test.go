@@ -22,7 +22,7 @@ func TestRankPlugins(t *testing.T) {
 		{Name: "kubectl", Desc: "control plane tool", Project: "https://github.com/k8s/kubectl", ProjectDesc: ""},
 		{Name: "kubeconform", Desc: "kubernetes manifest validator", Project: "https://github.com/yannh/kubeconform", ProjectDesc: "validates kubernetes config"},
 		{Name: "helm", Desc: "kubernetes package manager", Project: "https://github.com/helm/helm", ProjectDesc: ""},
-		{Name: "ripgrep", Desc: "grep on steroids", Project: "", ProjectDesc: ""},
+		{Name: "ripgrep", AppDesc: "fast file search tool", Desc: "grep on steroids", Project: "", ProjectDesc: ""},
 	}
 
 	// description-only match → helm is first (desc 'kubernetes ...'), rest dropped
@@ -45,6 +45,11 @@ func TestRankPlugins(t *testing.T) {
 	// project description search matches too
 	if ranks := indexesOf(rankPlugins(plugins, "manifest validator")); len(ranks) != 1 || ranks[0] != 1 {
 		t.Errorf("project-desc search should match kubeconform only: %v", ranks)
+	}
+
+	// the name-only app description is searchable too
+	if rankPI := indexesOf(rankPlugins(plugins, "fast file")); len(rankPI) != 1 || rankPI[0] != 3 {
+		t.Errorf("app-desc search should match ripgrep only: %v", rankPI)
 	}
 
 	// non-matching term yields nothing
@@ -381,13 +386,13 @@ func TestProjectRepoDescriptionOffline(t *testing.T) {
 }
 
 // TestRenderToolInfoSeparatesDescs proves the middle-column block keeps the
-// plugin description and the project description on distinct lines (the
-// project one indented behind a "—" dash) so the two never merge, and that
-// the block always occupies a fixed height (7 lines) so the actions below do
-// not jump.
+// plugin description and the project description on distinct lines so the two
+// never merge, that the app description follows the name, and that the block
+// always occupies a fixed height (10 lines) so the actions below do not jump.
 func TestRenderToolInfoSeparatesDescs(t *testing.T) {
 	m := newModelCheck([]Plugin{{
 		Name:        "adr",
+		AppDesc:     "Manage architecture decision records",
 		Desc:        "adr-tools plugin for the asdf version manager",
 		Repo:        "https://github.com/td7x/asdf-adr.git",
 		Project:     "https://github.com/npryce/adr-tools",
@@ -396,20 +401,29 @@ func TestRenderToolInfoSeparatesDescs(t *testing.T) {
 
 	block := strings.TrimSuffix(stripANSI(m.renderToolInfo(60)), "\n")
 	lines := strings.Split(block, "\n")
-	if len(lines) != 7 {
-		t.Fatalf("info block must be a fixed 7 lines, got %d:\n%q", len(lines), block)
+	if len(lines) != 10 {
+		t.Fatalf("info block must be a fixed 10 lines, got %d:\n%q", len(lines), block)
 	}
-	if lines[2] != "adr-tools plugin for the asdf version manager" {
-		t.Errorf("line 3 should be the plugin description, got %q", lines[2])
+	if lines[1] != "Manage architecture decision records" {
+		t.Errorf("line 2 should be the app description, got %q", lines[1])
 	}
-	if !strings.HasPrefix(lines[3], "plugin: ") {
-		t.Errorf("line 4 should be the plugin repo link, got %q", lines[3])
+	if lines[3] != "" {
+		t.Errorf("line 4 should be blank after the status, got %q", lines[3])
 	}
-	if !strings.HasPrefix(lines[4], "  — Architecture Decision Records") {
-		t.Errorf("line 5 should be the indented project description, got %q", lines[4])
+	if lines[4] != "adr-tools plugin for the asdf version manager" {
+		t.Errorf("line 5 should be the plugin description, got %q", lines[4])
 	}
-	if !strings.HasPrefix(lines[5], "project: https://github.com/npryce/adr-tools") {
-		t.Errorf("line 6 should be the project link, got %q", lines[5])
+	if !strings.HasPrefix(lines[5], "🔌 ") {
+		t.Errorf("line 6 should be the plugin repo link with an icon, got %q", lines[5])
+	}
+	if lines[6] != "" {
+		t.Errorf("line 7 should be blank before the project description, got %q", lines[6])
+	}
+	if lines[7] != "Architecture Decision Records (ADR) tooling" {
+		t.Errorf("line 8 should be the project description, got %q", lines[7])
+	}
+	if !strings.HasPrefix(lines[8], "↗ https://github.com/npryce/adr-tools") {
+		t.Errorf("line 9 should be the project link with an icon, got %q", lines[8])
 	}
 }
 
@@ -550,6 +564,39 @@ func TestFilterModal(t *testing.T) {
 	}
 	if m.filterOpen {
 		t.Fatal("q should close the modal")
+	}
+}
+
+// TestRemoveKeyDuringSearch proves the 'r' shortcut never fires while the
+// user is typing a search term (otherwise "terraform" would open the remove
+// confirmation on the highlighted plugin); instead the letter lands in the
+// filter input. Without an active filter, 'r' still opens the confirmation.
+func TestRemoveKeyDuringSearch(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "elasticsearch"}, {Name: "terraform"}}, "/tmp", true)
+
+	// active search "te…" → 'r' must extend the filter, not ask for removal
+	out, _ := m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m = out.(model)
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = out.(model)
+	if got := m.tools.FilterInput.Value(); got != "te" {
+		t.Fatalf("filter should be 'te', got %q", got)
+	}
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m = out.(model)
+	if m.confirmRm {
+		t.Fatal("'r' during a search must not open the remove confirmation")
+	}
+	if got := m.tools.FilterInput.Value(); got != "ter" {
+		t.Fatalf("'r' should land in the filter input, got %q", got)
+	}
+
+	// no active filter → 'r' still opens the confirmation
+	m2 := newModelCheck([]Plugin{{Name: "elasticsearch"}}, "/tmp", true)
+	out, _ = m2.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	m2 = out.(model)
+	if !m2.confirmRm {
+		t.Fatal("'r' with an empty filter must open the remove confirmation")
 	}
 }
 

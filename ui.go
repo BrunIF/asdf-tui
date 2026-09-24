@@ -548,7 +548,10 @@ func (m model) keyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.trackSelection(cmd)
 	}
-	if key == "r" {
+	// 'r' removes — but only when not actively typing into the search
+	// filter, otherwise the letter leaks into the remove confirmation while
+	// the user is looking for a plugin.
+	if key == "r" && m.tools.FilterInput.Value() == "" {
 		if m.selected() != nil {
 			m.confirmRm = true
 		}
@@ -639,11 +642,12 @@ func (m *model) syncToolItems() {
 }
 
 // rankPlugins searches a plugin subset by relevance. Every space-separated
-// token must match the name, project link, description or project description
-// of a plugin; the plugins score points per token from the most specific field
-// match (exact name > name prefix > name substring > project > project
-// description > description), plus a bonus when all tokens land in the name.
-// Results come back best-first so the most relevant plugin sits at the cursor.
+// token must match the name, project link, app description, project or plugin
+// description of a plugin; the plugins score points per token from the most
+// specific field match (exact name > name prefix > name substring > project >
+// project/app description > plugin description), plus a bonus when all tokens
+// land in the name. Results come back best-first so the most relevant plugin
+// sits at the cursor.
 func rankPlugins(plugins []Plugin, term string) []list.Rank {
 	if len(plugins) == 0 {
 		return nil
@@ -680,6 +684,7 @@ func pluginSearchScore(p Plugin, tokens []string) int {
 	name := strings.ToLower(p.Name)
 	project := strings.ToLower(p.Project)
 	projectDesc := strings.ToLower(p.ProjectDesc)
+	appDesc := strings.ToLower(p.AppDesc)
 	desc := strings.ToLower(p.Desc)
 	total := 0
 	allInName := true
@@ -695,6 +700,8 @@ func pluginSearchScore(p Plugin, tokens []string) int {
 		case strings.Contains(project, t):
 			tier = 3
 		case projectDesc != "" && strings.Contains(projectDesc, t):
+			tier = 2
+		case appDesc != "" && strings.Contains(appDesc, t):
 			tier = 2
 		case desc != "" && strings.Contains(desc, t):
 			tier = 1
@@ -1438,9 +1445,10 @@ func (m model) renderActions(w, h int) string {
 			"\n\n  " + styleOk.Render("y") + " yes    " + styleDim.Render("n") + " no"
 	}
 	var b strings.Builder
-	// fixed-height info block: name, desc, repo status, plugin + project links.
-	// It always occupies the same number of lines so the actions below never
-	// jump when the description or links change.
+	// fixed-height info block: name, app description, repo status, plugin +
+	// project descriptions with their links. It always occupies the same
+	// number of lines so the actions below never jump when the description or
+	// links change.
 	b.WriteString(m.renderToolInfo(w))
 	labels := []string{
 		"Install a specific version…",
@@ -1465,20 +1473,26 @@ func (m model) renderActions(w, h int) string {
 }
 
 // renderToolInfo prints the selected tool's header block on a fixed number of
-// lines (name, status, plugin description, plugin repo link, project/upstream
-// description, project link, blank separator) so the action list below keeps
-// a stable offset. The two descriptions are deliberately on distinct lines
-// (the project one is indented behind a "—" dash) so they never merge.
+// lines (name, name-only app description, repo status, plugin description,
+// plugin repo link, project description, project link, blank separator) so the
+// action list below keeps a stable offset. The two descriptions are
+// deliberately on distinct lines so they never merge.
 func (m model) renderToolInfo(w int) string {
 	var b strings.Builder
 	p := m.selected()
 	if p == nil {
 		b.WriteString(styleDim.Render("choose a tool in the left column"))
-		b.WriteString("\n\n\n\n\n\n")
+		b.WriteString("\n\n\n\n\n\n\n\n\n\n")
 		return b.String()
 	}
 	b.WriteString(styleBrand.Render(p.Name+pluginIcon(*p)) + "\n")
+	if ad := firstLine(p.AppDesc); ad != "" {
+		b.WriteString(styleDim.Render(ad) + "\n")
+	} else {
+		b.WriteString("\n")
+	}
 	b.WriteString(m.repoStatusLine(*p) + "\n")
+	b.WriteString("\n")
 	desc := firstLine(p.Desc)
 	if desc == "" {
 		b.WriteString(styleDim.Render("—") + "\n")
@@ -1486,17 +1500,18 @@ func (m model) renderToolInfo(w int) string {
 		b.WriteString(styleDim.Render(desc) + "\n")
 	}
 	if p.Repo != "" {
-		b.WriteString(styleDim.Render("plugin: "+p.Repo) + "\n")
+		b.WriteString(styleDim.Render("🔌 "+p.Repo) + "\n")
 	} else {
 		b.WriteString("\n")
 	}
+	b.WriteString("\n")
 	if pd := firstLine(p.ProjectDesc); pd != "" {
-		b.WriteString(styleDim.Render("  — "+pd) + "\n")
+		b.WriteString(styleDim.Render(pd) + "\n")
 	} else {
 		b.WriteString("\n")
 	}
 	if p.Project != "" {
-		b.WriteString(styleDim.Render("project: "+p.Project) + "\n")
+		b.WriteString(styleDim.Render("↗ "+p.Project) + "\n")
 	} else {
 		b.WriteString("\n")
 	}
@@ -1670,7 +1685,7 @@ func (m model) statusLine() string {
 	case m.confirmRm:
 		b.WriteString(styleDim.Render(" y — confirm removal · n — cancel") + "\n")
 	default:
-		b.WriteString(styleDim.Render(" type to search · ctrl+f filter · Enter actions · r remove · q quit") + "\n")
+		b.WriteString(styleDim.Render(" type to search names, apps, urls · ↑/↓ move · Enter pick · Esc clear filter") + "\n")
 	}
 	if m.errMsg != "" {
 		b.WriteString(styleErr.Render(" ✗ "+m.errMsg) + "\n")
