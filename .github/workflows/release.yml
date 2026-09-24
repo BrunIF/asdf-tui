@@ -9,6 +9,11 @@
 #   workflow_dispatch   ->  build 1.2.3-{alpha|beta|rc}.<run#>   artifact only
 #   push on main        ->  build 1.2.4 + git tag + GitHub Release   (the merge)
 #
+# The pull_request and push triggers are `paths`-filtered: the binary only
+# depends on the Go sources, so a docs/catalog-only change is never rebuilt
+# nor released (docs-only merges do not bump the version). workflow_dispatch
+# stays unconditional — it is an explicit "build now".
+#
 # Every job that touches the version runs the same
 #   .github/scripts/next-version.sh for-...
 # the developer can run on their machine before pushing, so a reviewer can
@@ -18,6 +23,11 @@ name: release
 
 on:
   pull_request:
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/**'
   workflow_dispatch:
     inputs:
       prerelease:
@@ -27,6 +37,11 @@ on:
         options: [alpha, beta, rc]
   push:
     branches: [main]
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/**'
 
 jobs:
   version:
