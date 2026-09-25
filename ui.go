@@ -1480,6 +1480,17 @@ func verModeName(v verMode) string {
 	return ""
 }
 
+// toolListTitle keeps the active text search visible after bubbles switches
+// back from its input to the list title. Without this, accepting "kubernetes"
+// leaves a filtered list under a bare "List" title with no indication of why.
+func (m model) toolListTitle() string {
+	query := strings.TrimSpace(m.tools.FilterInput.Value())
+	if query == "" {
+		return "List"
+	}
+	return "List · filter: " + query
+}
+
 func (m model) renderTools(w, h int) string {
 	if len(m.plugins) == 0 {
 		return styleDim.Render("empty catalog")
@@ -1487,6 +1498,7 @@ func (m model) renderTools(w, h int) string {
 	if len(m.filteredPlugins()) == 0 {
 		return styleDim.Render("no plugins match " + m.filterLabel() + " (ctrl+f)")
 	}
+	m.tools.Title = m.toolListTitle()
 	m.tools.SetSize(w, h)
 	return m.tools.View()
 }

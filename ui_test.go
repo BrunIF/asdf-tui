@@ -88,6 +88,32 @@ func indexesOf(ranks []list.Rank) []int {
 	return out
 }
 
+func TestToolListTitleShowsSearch(t *testing.T) {
+	m := newModelCheck([]Plugin{
+		{Name: "kubernetes"},
+		{Name: "helm"},
+	}, "/tmp", true)
+
+	if got := m.toolListTitle(); got != "List" {
+		t.Fatalf("unfiltered list title = %q, want %q", got, "List")
+	}
+
+	m.tools.SetFilterText("kubernetes")
+	if got := m.toolListTitle(); got != "List · filter: kubernetes" {
+		t.Fatalf("filtered list title = %q, want %q", got, "List · filter: kubernetes")
+	}
+
+	view := stripANSI(m.renderTools(40, 10))
+	if !strings.Contains(view, "List · filter: kubernetes") {
+		t.Fatalf("filtered list should show its query next to List:\n%s", view)
+	}
+
+	m.tools.ResetFilter()
+	if got := m.toolListTitle(); got != "List" {
+		t.Fatalf("cleared list title = %q, want %q", got, "List")
+	}
+}
+
 // TestVersionWindowTop proves PgUp/PgDn move the visible window by a full page
 // (the regression where the list did not scroll when the selection left the
 // visible rows).

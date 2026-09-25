@@ -92,8 +92,9 @@ hand-built binaries, the stamped release version otherwise).
 **Left column — tools catalog.** Just start typing; the list filters live.
 `↑/↓`, `j/k` navigate. `r` remove (asks for confirmation). `q` quits (when the
 search field is empty); `Esc` clears the search. `Enter` moves to the actions
-column. Rows show just the name plus a state icon: `🔒` archived repo, `🗑`
-dropped from the catalog, `🚫` unreachable.
+column. The list title keeps the active search visible, for example
+`List · filter: kubernetes`. Rows show just the name plus a state icon: `🔒`
+archived repo, `🗑` dropped from the catalog, `🚫` unreachable.
 
 **Filtering the catalog (`ctrl+f`).** The columns can be narrowed to a subset
 of the catalog; the type-to-search filter keeps working on top of the subset.
