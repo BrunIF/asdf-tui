@@ -7,7 +7,8 @@
 #
 #   pull_request        ->  build 1.2.3-alpha.<PR#>      artifact only
 #   workflow_dispatch   ->  build 1.2.3-{alpha|beta|rc}.<run#>   artifact only
-#   workflow_dispatch   ->  stable release when explicitly selected
+#   workflow_dispatch   ->  stable release when explicitly selected, with a
+#                            chosen patch/minor/major bump
 #   push on main        ->  build 1.2.4 + git tag + GitHub Release   (the merge)
 #
 # A push to main is a patch bump. Put [minor] or [major] in the merge commit
@@ -39,6 +40,11 @@ on:
         type: choice
         default: rc
         options: [alpha, beta, rc, stable]
+      bump_kind:
+        description: Version bump used only when release_type is stable
+        type: choice
+        default: patch
+        options: [patch, minor, major]
   push:
     branches: [main]
     paths:
@@ -72,7 +78,7 @@ jobs:
               V="$(.github/scripts/next-version.sh for-pr "${{ github.event.pull_request.number }}")" ;;
             workflow_dispatch)
               if [[ "${{ github.event.inputs.release_type }}" == "stable" ]]; then
-                V="$(.github/scripts/next-version.sh for-merge)"
+                V="$(.github/scripts/next-version.sh for-merge "${{ github.event.inputs.bump_kind }}")"
               else
                 V="$(.github/scripts/next-version.sh for-dispatch "${{ github.event.inputs.release_type }}")"
               fi ;;
