@@ -7,6 +7,7 @@
 #
 #   pull_request        ->  build 1.2.3-alpha.<PR#>      artifact only
 #   workflow_dispatch   ->  build 1.2.3-{alpha|beta|rc}.<run#>   artifact only
+#   workflow_dispatch   ->  stable release when explicitly selected
 #   push on main        ->  build 1.2.4 + git tag + GitHub Release   (the merge)
 #
 # A push to main is a patch bump. Put [minor] or [major] in the merge commit
@@ -33,11 +34,11 @@ on:
       - 'go.sum'
   workflow_dispatch:
     inputs:
-      prerelease:
-        description: prerelease flavor for the manual artifact build
+      release_type:
+        description: Select a prerelease artifact build or publish a stable release
         type: choice
         default: rc
-        options: [alpha, beta, rc]
+        options: [alpha, beta, rc, stable]
   push:
     branches: [main]
     paths:
@@ -70,7 +71,11 @@ jobs:
             pull_request)
               V="$(.github/scripts/next-version.sh for-pr "${{ github.event.pull_request.number }}")" ;;
             workflow_dispatch)
-              V="$(.github/scripts/next-version.sh for-dispatch "${{ github.event.inputs.prerelease }}")" ;;
+              if [[ "${{ github.event.inputs.release_type }}" == "stable" ]]; then
+                V="$(.github/scripts/next-version.sh for-merge)"
+              else
+                V="$(.github/scripts/next-version.sh for-dispatch "${{ github.event.inputs.release_type }}")"
+              fi ;;
             push)
               # The bump kind comes from the merge commit: a plain merge is a
               # patch, a message containing [minor] or [major] bumps that far.
@@ -150,7 +155,11 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main' &&
+       github.event.inputs.release_type == 'stable')
     needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
