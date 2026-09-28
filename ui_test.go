@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -534,6 +536,17 @@ func pluginNames(ps []Plugin) []string {
 	return out
 }
 
+// itemsToPlugins unwraps the list items back into catalog rows.
+func itemsToPlugins(items []list.Item) []Plugin {
+	out := make([]Plugin, 0, len(items))
+	for _, it := range items {
+		if pi, ok := it.(pluginItem); ok {
+			out = append(out, pi.p)
+		}
+	}
+	return out
+}
+
 // TestFilterModal proves ctrl+f opens the chooser, ↑/↓ + Enter apply the
 // highlighted mode, digits apply directly, and Esc/q cancel without changing
 // the current filter.
@@ -610,7 +623,7 @@ func TestRemoveKeyDuringSearch(t *testing.T) {
 	}
 	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
 	m = out.(model)
-	if m.confirmRm {
+	if m.cf != nil {
 		t.Fatal("'r' during a search must not open the remove confirmation")
 	}
 	if got := m.tools.FilterInput.Value(); got != "ter" {
@@ -621,7 +634,7 @@ func TestRemoveKeyDuringSearch(t *testing.T) {
 	m2 := newModelCheck([]Plugin{{Name: "elasticsearch"}}, "/tmp", true)
 	out, _ = m2.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
 	m2 = out.(model)
-	if !m2.confirmRm {
+	if m2.cf == nil || m2.cf.kind != confirmRemovePlugin {
 		t.Fatal("'r' with an empty filter must open the remove confirmation")
 	}
 }
@@ -793,12 +806,14 @@ func TestUpdateAvailable(t *testing.T) {
 	}
 }
 
-// TestUpdateModalKeys proves y quits with the upgrade flag set (the quit cmd
-// actually yields tea.QuitMsg), n dismisses without quitting, and the render
-// announces the published version.
+// TestUpdateModalKeys proves the self-update offer goes through the shared
+// confirmation modal: y (or moving the highlight to Yes and pressing Enter)
+// quits with the upgrade flag set — the quit cmd actually yields tea.QuitMsg —
+// while n/Esc dismiss it without quitting, and the render announces both the
+// published and the running version.
 func TestUpdateModalKeys(t *testing.T) {
 	m := newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
-	m.updateOpen, m.updateLatest = true, "0.2.0"
+	m.openConfirm(confirmSelfUpdate, "0.2.0", "")
 
 	out, cmd := m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	got := asModel(t, out)
@@ -811,17 +826,35 @@ func TestUpdateModalKeys(t *testing.T) {
 		t.Fatalf("y must return tea.Quit, got %T", cmd())
 	}
 
+	// arrows then Enter: Enter alone must not install (the highlight starts
+	// on No), ← moves it to Yes
 	m = newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
-	m.updateOpen, m.updateLatest = true, "0.2.0"
+	m.openConfirm(confirmSelfUpdate, "0.2.0", "")
+	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := asModel(t, out); got.cf != nil || got.doUpdate || cmd != nil {
+		t.Fatal("Enter on the default No button must only close the dialog")
+	}
+	m = newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
+	m.openConfirm(confirmSelfUpdate, "0.2.0", "")
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyLeft})
+	m = asModel(t, out)
+	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyEnter})
+	got = asModel(t, out)
+	if !got.doUpdate || got.cf != nil || cmd == nil {
+		t.Fatal("← then Enter must run the confirmed update")
+	}
+
+	m = newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
+	m.openConfirm(confirmSelfUpdate, "0.2.0", "")
 	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyEsc})
 	got = asModel(t, out)
-	if got.updateOpen || got.doUpdate || cmd != nil {
+	if got.cf != nil || got.doUpdate || cmd != nil {
 		t.Fatal("Esc must dismiss the prompt without quitting")
 	}
 
 	m = newModelCheck([]Plugin{{Name: "a"}}, "/tmp", true)
-	m.updateOpen, m.updateLatest = true, "0.2.0"
-	s := m.renderUpdateModal()
+	m.openConfirm(confirmSelfUpdate, "0.2.0", "")
+	s := stripANSI(m.renderConfirmModal())
 	if !strings.Contains(s, "0.2.0") || !strings.Contains(s, version) {
 		t.Fatalf("update modal should announce latest and running version:\n%s", s)
 	}
@@ -862,6 +895,57 @@ func TestCurrentVersionNextToName(t *testing.T) {
 	}
 }
 
+// TestParseAsdfCurrent proves the `asdf current` decoder keeps the tool names
+// and drops the table header — the "added to asdf" set, which also covers
+// custom plugins that never joined the asdf-plugins registry.
+func TestParseAsdfCurrent(t *testing.T) {
+	out := "Name            Version         Source                    Installed\n" +
+		"aws-sso-cli     ______          ______                    \n" +
+		"k9s             0.51.0          /home/u/.tool-versions     true\n" +
+		"prek            ______          ______                    \n"
+
+	got := parseAsdfCurrent(out)
+	if strings.Join(got, ",") != "aws-sso-cli,k9s,prek" {
+		t.Fatalf("asdf current should decode to the tool names, got %v", got)
+	}
+	if names := parseAsdfCurrent(""); len(names) != 0 {
+		t.Fatalf("empty output must decode to nothing, got %v", names)
+	}
+}
+
+// TestHeaderCountsCatalog proves the tools-column header carries how many
+// plugins the column holds and how many of them are custom (added straight
+// from a repo URL, hence absent from the asdf-plugins registry).
+func TestHeaderCountsCatalog(t *testing.T) {
+	plugins := []Plugin{
+		{Name: "k9s"},
+		{Name: "kubectl"},
+		{Name: "nodejs"},
+		{Name: "prek", Repo: "https://github.com/a4z/asdf-prek.git", Custom: true},
+	}
+	m := newModelCheck(plugins, "/tmp", true)
+	m.addedSet = map[string]bool{"k9s": true, "prek": true}
+
+	if got := m.headerHints(); got != "tools — 4 plugins (1 custom) · type to search" {
+		t.Fatalf("header should count the catalog and its custom rows, got %q", got)
+	}
+
+	// a subset reports how many rows it leaves of the total
+	m.filter = filterAdded
+	if got := m.headerHints(); got != "tools — added · 2 of 4 (1 custom) · type to search" {
+		t.Fatalf("filtered header should count rows of the total, got %q", got)
+	}
+
+	// the custom plugin belongs to every subset it qualifies for
+	if got := strings.Join(pluginNames(m.filteredPlugins()), ","); got != "k9s,prek" {
+		t.Fatalf("added filter should list the custom plugin, got %v", got)
+	}
+	m.filter = filterActive
+	if got := strings.Join(pluginNames(m.filteredPlugins()), ","); got != "k9s,kubectl,nodejs,prek" {
+		t.Fatalf("active filter should list the custom plugin, got %v", got)
+	}
+}
+
 // TestParseInstalledVersions proves the `asdf list` decoder separates
 // installed versions from the current one (the `*`-marked line), tolerates
 // "(set by …)" annotations and skips the "No versions installed" message.
@@ -888,8 +972,8 @@ func TestParseInstalledVersions(t *testing.T) {
 }
 
 // TestUninstallFlow proves the fifth action ("Uninstall a version…") opens
-// the right column on the installed versions, Enter on a row arms the y/n
-// confirmation (drawn over the list), n/Esc cancel without leaving, and y
+// the right column on the installed versions, Enter on a row arms the shared
+// confirmation modal over the columns, n/Esc cancel without leaving, and y
 // schedules the `asdf uninstall` task.
 func TestUninstallFlow(t *testing.T) {
 	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
@@ -907,18 +991,21 @@ func TestUninstallFlow(t *testing.T) {
 	// Enter on the first (newest) version arms the confirmation
 	out, _ = m.versionsKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = asModel(t, out)
-	if m.confirmUninstall != "20.0.0" {
-		t.Fatalf("Enter should arm the confirmation on 20.0.0, got %q", m.confirmUninstall)
+	if m.cf == nil || m.cf.kind != confirmUninstallVersion || m.cf.arg != "20.0.0" {
+		t.Fatalf("Enter should arm the confirmation on 20.0.0, got %+v", m.cf)
 	}
-	if s := m.renderVersions(30, 20); !strings.Contains(s, "Uninstall nodejs 20.0.0?") {
-		t.Fatalf("confirm view should ask about the version:\n%s", s)
+	if m.cf.sel != btnNo {
+		t.Fatal("the confirmation must start on No so Enter cannot destroy data")
+	}
+	if s := stripANSI(m.renderConfirmModal()); !strings.Contains(s, "Uninstall nodejs 20.0.0?") {
+		t.Fatalf("confirm modal should ask about the version:\n%s", s)
 	}
 
 	// n cancels and stays in the list
 	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	m = asModel(t, out)
-	if m.confirmUninstall != "" || m.mode != verUninstall {
-		t.Fatalf("n should cancel the confirmation, got %q mode=%d", m.confirmUninstall, m.mode)
+	if m.cf != nil || m.mode != verUninstall {
+		t.Fatalf("n should cancel the confirmation, got %+v mode=%d", m.cf, m.mode)
 	}
 
 	// re-arm and y runs the task (asdf is absent in tests → the task errors)
@@ -926,6 +1013,9 @@ func TestUninstallFlow(t *testing.T) {
 	m = asModel(t, out)
 	conf, cmd := m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	m = asModel(t, conf)
+	if m.cf != nil {
+		t.Fatal("confirming must close the modal")
+	}
 	if !m.busy || cmd == nil {
 		t.Fatalf("y should mark busy and schedule the uninstall, busy=%v", m.busy)
 	}
@@ -935,19 +1025,503 @@ func TestUninstallFlow(t *testing.T) {
 	}
 }
 
+// TestConfirmModalArrows proves the answer can be picked with ←/→: the
+// highlight moves between the two buttons, and only Enter on Yes runs the
+// action — everywhere in the dialog, not just on the letter keys.
+func TestConfirmModalArrows(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.state["nodejs"] = toolSt{added: true, versions: []string{"20.0.0"}, loaded: true}
+	m.openConfirm(confirmRemovePlugin, "nodejs", "")
+	if m.cf.sel != btnNo {
+		t.Fatal("the dialog must open on No")
+	}
+
+	out, cmd := m.keyMsg(tea.KeyMsg{Type: tea.KeyLeft})
+	m = asModel(t, out)
+	if m.cf.sel != btnYes || cmd != nil {
+		t.Fatalf("← must select Yes without running, sel=%d cmd=%v", m.cf.sel, cmd)
+	}
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRight})
+	m = asModel(t, out)
+	if m.cf.sel != btnNo {
+		t.Fatal("→ must move back to No")
+	}
+	// h/l mirror ←/→
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	m = asModel(t, out)
+	if m.cf.sel != btnYes {
+		t.Fatal("h must select Yes")
+	}
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = asModel(t, out)
+	if m.cf.sel != btnNo {
+		t.Fatal("l must select No")
+	}
+	// tab cycles between the two buttons
+	for _, k := range []tea.KeyMsg{{Type: tea.KeyTab}, {Type: tea.KeyShiftTab}} {
+		out, _ = m.keyMsg(k)
+		m = asModel(t, out)
+		if m.cf == nil || m.cf.sel != btnYes {
+			t.Fatalf("%v must select Yes", k)
+		}
+		out, _ = m.keyMsg(k)
+		m = asModel(t, out)
+		if m.cf == nil || m.cf.sel != btnNo {
+			t.Fatalf("%v must select No", k)
+		}
+	}
+
+	// Enter on No just closes the dialog, nothing is run
+	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, out)
+	if m.cf != nil || m.busy || cmd != nil {
+		t.Fatal("Enter on No must only close the dialog")
+	}
+
+	// ← then Enter on Yes runs the removal (asdf is absent in tests → error)
+	m.openConfirm(confirmRemovePlugin, "nodejs", "")
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyLeft})
+	m = asModel(t, out)
+	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, out)
+	if !m.busy || cmd == nil {
+		t.Fatalf("← then Enter must run the removal, busy=%v", m.busy)
+	}
+	if msg, ok := cmd().(taskDoneMsg); !ok || !strings.HasPrefix(msg.label, "Remove nodejs") {
+		t.Fatalf("task label should name the plugin, got %+v", msg)
+	}
+}
+
+// TestConfirmModalCoversScreen proves every confirmation is a centered modal
+// over the whole TUI (not an inline line in a column) and that the columns
+// keep their own content underneath it.
+func TestConfirmModalCoversScreen(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.width, m.height = 120, 30
+	m.openConfirm(confirmRemovePlugin, "nodejs", "")
+
+	screen := stripANSI(m.View())
+	if !strings.Contains(screen, "Remove nodejs?") {
+		t.Fatalf("the dialog should be drawn over the screen:\n%s", screen)
+	}
+	// the columns keep their own content underneath the dialog
+	if !strings.Contains(screen, "nodejs") || !strings.Contains(screen, "Remove plugin") {
+		t.Fatalf("columns should stay visible under the modal:\n%s", screen)
+	}
+	// …and the prompt is not rendered inline in the middle column anymore
+	if strings.Contains(m.renderActions(30, 20), "yes") {
+		t.Fatalf("the action column must not hold an inline y/n prompt:\n%s", m.renderActions(30, 20))
+	}
+}
+
+// TestOverlayLineKeepsColouredRowsAligned guards the dialog splice against
+// counting colour escapes as cells. When it did, the dialog was placed off
+// centre and the row ended up wider than the terminal, which wrapped it and
+// shifted every line below — the visible symptom of a broken layout.
+func TestOverlayLineKeepsColouredRowsAligned(t *testing.T) {
+	const width = 80
+	// 1 + 30 + 20 + 2 (the lock) + 27 = 80 cells, with a colour escape in front.
+	base := "\x1b[38;5;140m│" + strings.Repeat("a", 30) + "\x1b[0m" +
+		strings.Repeat("b", 20) + "🔒" + strings.Repeat("c", 27)
+	box := "\x1b[38;5;86m│ help  │\x1b[0m"
+	const left = 30
+
+	got := stripANSI(overlayLine(base, box, left, width))
+	want := "│" + strings.Repeat("a", left-1) + "│ help  │" +
+		strings.Repeat("b", 12) + "🔒" + strings.Repeat("c", 27)
+	if got != want {
+		t.Fatalf("dialog spliced at the wrong cell:\n got %q\nwant %q", got, want)
+	}
+	if w := lipgloss.Width(overlayLine(base, box, left, width)); w != width {
+		t.Fatalf("row is %d cells wide, terminal is %d", w, width)
+	}
+	// a dialog wider than the room left is clipped, never wrapped
+	narrow := overlayLine(base, box, left, width-10)
+	if w := lipgloss.Width(narrow); w != width-10 {
+		t.Fatalf("clipped row is %d cells wide, terminal is %d", w, width-10)
+	}
+}
+
+// TestModalScreensFitTheWidth proves no dialog — at any size, with any number
+// of plugins — pushes a row past the terminal width, which is what made the
+// columns jump sideways when a dialog was open.
+func TestModalScreensFitTheWidth(t *testing.T) {
+	for _, size := range [][2]int{{80, 24}, {120, 30}, {209, 37}} {
+		w, h := size[0], size[1]
+		m := newModelCheck([]Plugin{
+			{Name: "nodejs"},
+			{Name: "prek", Repo: "https://github.com/a4z/asdf-prek.git", Custom: true},
+			{Name: "terraform"},
+		}, "/tmp", true)
+		m.width, m.height = w, h
+		m.addedSet["nodejs"] = true
+		open := map[string]func(model) model{
+			"help":   func(m model) model { m.helpOpen = true; return m },
+			"add":    func(m model) model { m.addOpen, m.add = true, newAddForm(); return m },
+			"filter": func(m model) model { m.filterOpen = true; return m },
+			"warn":   func(m model) model { m.warnOpen = true; return m },
+			"ask":    func(m model) model { m.openConfirm(confirmRemovePlugin, "nodejs", ""); return m },
+		}
+		for name, show := range open {
+			mm := show(m)
+			for i, line := range strings.Split(mm.View(), "\n") {
+				if got := lipgloss.Width(line); got > w {
+					t.Errorf("%s dialog at %dx%d: row %d is %d cells wide", name, w, h, i, got)
+				}
+			}
+		}
+	}
+}
+
 // TestUninstallSuccessExitsList proves a successful uninstall task closes the
 // version list back to the actions column and clears the confirmation.
 func TestUninstallSuccessExitsList(t *testing.T) {
 	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
 	m.state["nodejs"] = toolSt{added: true, versions: []string{"20.0.0", "18.0.0"}, loaded: true}
-	m.mode, m.focus, m.confirmUninstall = verUninstall, focusVersions, "18.0.0"
+	m.mode, m.focus = verUninstall, focusVersions
+	m.openConfirm(confirmUninstallVersion, "nodejs 18.0.0", "18.0.0")
 
 	out, _ := m.Update(taskDoneMsg{label: "Uninstall nodejs 18.0.0"})
 	m = asModel(t, out)
-	if m.mode != verNone || m.focus != focusActions || m.confirmUninstall != "" {
-		t.Fatalf("successful uninstall should exit the list, mode=%d focus=%d confirm=%q", m.mode, m.focus, m.confirmUninstall)
+	if m.mode != verNone || m.focus != focusActions || m.cf != nil {
+		t.Fatalf("successful uninstall should exit the list, mode=%d focus=%d cf=%+v", m.mode, m.focus, m.cf)
 	}
 	if m.errMsg != "" || !strings.Contains(m.statusMsg, "done") {
 		t.Fatalf("success should report done, err=%q status=%q", m.errMsg, m.statusMsg)
 	}
+}
+
+// typeRunes feeds printable characters into the model the way the terminal
+// delivers them.
+func typeRunes(t *testing.T, m model, s string) model {
+	t.Helper()
+	for _, r := range s {
+		out, _ := m.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = asModel(t, out)
+	}
+	return m
+}
+
+// TestHelpModal proves the "?" dialog opens from every column, lists the
+// catalog counters and the key map, swallows keys while it is up, and never
+// covers another modal.
+func TestHelpModal(t *testing.T) {
+	m := newModelCheck([]Plugin{
+		{Name: "nodejs"},
+		{Name: "prek", Repo: "https://github.com/a4z/asdf-prek.git", Custom: true},
+	}, "/tmp", true)
+	m.width, m.height = 120, 30
+	m.addedSet["nodejs"] = true
+
+	box := stripANSI(m.renderHelpModal())
+	for _, want := range []string{
+		"asdf-tui",               // about
+		"2 plugins",              // statistics
+		"1 installed in asdf",    // statistics
+		"1 available",            // statistics
+		"1 custom",               // statistics
+		"ctrl+p", "add a plugin", // key map
+		"ctrl+f", "filter the catalog", // key map
+		"remove the plugin",    // key map
+		"←/→", "pick Yes / No", // key map
+	} {
+		if !strings.Contains(box, want) {
+			t.Errorf("help dialog should mention %q:\n%s", want, box)
+		}
+	}
+
+	// opens from every column
+	for _, f := range []focus{focusTools, focusActions, focusVersions} {
+		m2 := m
+		m2.focus = f
+		if f == focusVersions {
+			m2.mode = verInstall
+		}
+		out, _ := m2.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+		m2 = asModel(t, out)
+		if !m2.helpOpen {
+			t.Fatalf("? must open the help dialog from focus %d", f)
+		}
+		if got := m2.activeModal(); !strings.Contains(stripANSI(got), "column TUI") {
+			t.Fatalf("the help dialog should be the drawn modal, got %q", stripANSI(got))
+		}
+		// keys it does not use are swallowed, they must not reach the columns
+		out, cmd := m2.keyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		m2 = asModel(t, out)
+		if !m2.helpOpen || cmd != nil || m2.selAct != 0 {
+			t.Fatalf("an open help dialog must swallow keys, helpOpen=%v selAct=%d", m2.helpOpen, m2.selAct)
+		}
+		// …and Esc/?/q close it without quitting
+		for _, k := range []tea.KeyMsg{
+			{Type: tea.KeyRunes, Runes: []rune{'?'}},
+			{Type: tea.KeyRunes, Runes: []rune{'q'}},
+			{Type: tea.KeyEsc},
+		} {
+			m2.helpOpen = true
+			out, cmd := m2.keyMsg(k)
+			m2 = asModel(t, out)
+			if m2.helpOpen || cmd != nil {
+				t.Fatalf("%v must close the help dialog and nothing else", k)
+			}
+		}
+	}
+}
+
+// TestHelpKeyIsTypedIntoSearch proves "?" is a search character while a filter
+// is being typed — the help dialog never eats a keystroke of a search.
+func TestHelpKeyIsTypedIntoSearch(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "helm"}}, "/tmp", true)
+	m = typeRunes(t, m, "a?")
+	if m.helpOpen {
+		t.Fatal("? must not open the help dialog while searching")
+	}
+	if got := m.tools.FilterInput.Value(); got != "a?" {
+		t.Fatalf("? should land in the filter input, got %q", got)
+	}
+
+	// the versions-column filter behaves the same
+	m2 := newModelCheck([]Plugin{{Name: "helm"}}, "/tmp", true)
+	m2.focus, m2.mode = focusVersions, verInstall
+	m2 = typeRunes(t, m2, "1?")
+	if m2.helpOpen {
+		t.Fatal("? must not open the help dialog while filtering versions")
+	}
+	if m2.verFilter != "1?" {
+		t.Fatalf("? should land in the version filter, got %q", m2.verFilter)
+	}
+}
+
+// TestHelpModalNeverCoversAnotherModal proves the precedence: warning → filter
+// chooser → confirmation → add form → help.
+func TestHelpModalNeverCoversAnotherModal(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.width, m.height = 120, 30
+	m.helpOpen = true
+
+	m.filterOpen = true
+	if got := stripANSI(m.activeModal()); !strings.Contains(got, "pick") {
+		t.Fatalf("the filter chooser outranks help:\n%s", got)
+	}
+	m.filterOpen = false
+
+	m.openConfirm(confirmRemovePlugin, "nodejs", "")
+	if got := stripANSI(m.activeModal()); !strings.Contains(got, "Remove nodejs?") {
+		t.Fatalf("a confirmation outranks help:\n%s", got)
+	}
+	m.cf = nil
+
+	m.addOpen, m.add = true, newAddForm()
+	if got := stripANSI(m.activeModal()); !strings.Contains(got, "add plugin") {
+		t.Fatalf("the add form outranks help:\n%s", got)
+	}
+	m.addOpen = false
+
+	if got := stripANSI(m.activeModal()); !strings.Contains(got, "column TUI") {
+		t.Fatalf("help is drawn when nothing else is open:\n%s", got)
+	}
+}
+
+// TestAddPluginForm proves the ctrl+p form: two inputs, Tab switches fields,
+// Enter validates the name and then runs `asdf plugin add`, Esc cancels.
+func TestAddPluginForm(t *testing.T) {
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.width, m.height = 120, 30
+
+	out, cmd := m.keyMsg(tea.KeyMsg{Type: tea.KeyCtrlP})
+	m = asModel(t, out)
+	if !m.addOpen || cmd == nil {
+		t.Fatal("ctrl+p must open the add form and start the cursor blink")
+	}
+	if !m.add.name.Focused() || m.add.repo.Focused() {
+		t.Fatal("the name field must take the focus first")
+	}
+	if got := stripANSI(m.View()); strings.Count(got, "add plugin") == 0 {
+		t.Fatalf("the form must be drawn as a modal:\n%s", got)
+	}
+
+	// typing lands in the name field
+	m = typeRunes(t, m, "prek")
+	if got := m.add.name.Value(); got != "prek" {
+		t.Fatalf("name field should hold %q, got %q", "prek", got)
+	}
+
+	// Tab moves to the repo field, then back
+	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyTab})
+	m = asModel(t, out)
+	if m.add.field != 1 || cmd == nil || !m.add.repo.Focused() {
+		t.Fatalf("Tab must focus the repo field, field=%d", m.add.field)
+	}
+	m = typeRunes(t, m, "https://github.com/a4z/asdf-prek.git")
+	if got := m.add.repo.Value(); got != "https://github.com/a4z/asdf-prek.git" {
+		t.Fatalf("repo field should hold the URL, got %q", got)
+	}
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = asModel(t, out)
+	if m.add.field != 0 {
+		t.Fatalf("shift+Tab must go back to the name field, field=%d", m.add.field)
+	}
+
+	// Enter runs the add (the command itself is not executed: it would shell
+	// out to asdf and really add a plugin)
+	out, cmd = m.keyMsg(tea.KeyMsg{Type: tea.KeyEnter})
+	m = asModel(t, out)
+	if m.addOpen || !m.busy || cmd == nil {
+		t.Fatalf("Enter must close the form and run the add, busy=%v cmd=%v", m.busy, cmd != nil)
+	}
+	if !strings.Contains(m.busyLabel, "prek") {
+		t.Fatalf("the busy label should name the plugin, got %q", m.busyLabel)
+	}
+
+	// Esc cancels…
+	out, _ = m.keyMsg(tea.KeyMsg{Type: tea.KeyEsc})
+	if asModel(t, out).addOpen {
+		t.Fatal("Esc must close the form")
+	}
+	// …and an empty name is refused in place
+	m2 := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	out, _ = m2.keyMsg(tea.KeyMsg{Type: tea.KeyCtrlP})
+	m2 = asModel(t, out)
+	out, cmd = m2.keyMsg(tea.KeyMsg{Type: tea.KeyEnter})
+	m2 = asModel(t, out)
+	if !m2.addOpen || m2.busy || cmd != nil {
+		t.Fatalf("an empty name must be refused, addOpen=%v busy=%v", m2.addOpen, m2.busy)
+	}
+	if m2.add.err == "" {
+		t.Fatal("an empty name must be reported in the form")
+	}
+}
+
+// TestAddPluginReachesCatalog proves a successful add inserts the row into the
+// catalog slice, the list items and the YAML, keeping the name sorted.
+func TestAddPluginReachesCatalog(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugins.yaml")
+
+	m := newModelCheck([]Plugin{{Name: "nodejs"}, {Name: "terraform"}}, "/tmp", true)
+	m.catalogFile = path
+	if err := m.mergePlugin(Plugin{Name: "prek", Repo: "https://github.com/a4z/asdf-prek.git", Custom: true}); err != nil {
+		t.Fatalf("mergePlugin: %v", err)
+	}
+	if got := strings.Join(pluginNames(m.plugins), ","); got != "nodejs,prek,terraform" {
+		t.Fatalf("the catalog slice should be sorted with the new row, got %v", got)
+	}
+	items := pluginNames(itemsToPlugins(m.tools.Items()))
+	if !strings.Contains(strings.Join(items, ","), "prek") {
+		t.Fatalf("the list should show the new plugin, got %v", items)
+	}
+	if p := m.selected(); p == nil || p.Name != "prek" {
+		t.Fatalf("the new plugin should be selected, got %+v", p)
+	}
+	saved, err := loadCatalog(path)
+	if err != nil {
+		t.Fatalf("loadCatalog: %v", err)
+	}
+	if got := strings.Join(pluginNames(saved), ","); got != "nodejs,prek,terraform" {
+		t.Fatalf("the new plugin should be persisted, got %v", got)
+	}
+	if saved[1].Repo != "https://github.com/a4z/asdf-prek.git" || !saved[1].Custom {
+		t.Fatalf("the saved row should keep its repo and custom flag, got %+v", saved[1])
+	}
+}
+
+// TestAddPluginKeepsCatalogRow proves adding a plugin that is already listed
+// only refreshes its repo URL and custom flag — the catalog description and
+// flags stay.
+func TestAddPluginKeepsCatalogRow(t *testing.T) {
+	m := newModelCheck([]Plugin{
+		{Name: "prek", Desc: "pre-commit hooks", Project: "prek", Archived: true},
+	}, "/tmp", true)
+	m.catalogFile = filepath.Join(t.TempDir(), "plugins.yaml")
+
+	if err := m.mergePlugin(Plugin{Name: "prek", Repo: "https://github.com/a4z/asdf-prek.git", Custom: true}); err != nil {
+		t.Fatalf("mergePlugin: %v", err)
+	}
+	if len(m.plugins) != 1 {
+		t.Fatalf("no duplicate row should be added, got %v", pluginNames(m.plugins))
+	}
+	p := m.plugins[0]
+	if p.Desc != "pre-commit hooks" || !p.Archived || !p.Custom || p.Repo == "" {
+		t.Fatalf("the catalog row should be kept and enriched, got %+v", p)
+	}
+}
+
+// TestFilterLabelsAreShort proves the filter chooser labels stay one word
+// each — no "not archived/removed/unreachable" parenthesis.
+func TestFilterLabelsAreShort(t *testing.T) {
+	for _, o := range filterOptions {
+		if strings.Contains(o.label, "(") {
+			t.Errorf("filter label %q should not carry an explanation", o.label)
+		}
+	}
+	m := newModelCheck([]Plugin{{Name: "nodejs"}}, "/tmp", true)
+	m.filter = filterActive
+	if got := m.filterLabel(); strings.Contains(got, "(") {
+		t.Errorf("the header filter label should stay short, got %q", got)
+	}
+}
+
+// TestAddPluginResolvesRow drives the whole "add a plugin" background command
+// against a stub `asdf` on PATH: the row it reports back must carry the repo URL
+// asdf recorded and the custom flag when the name is outside asdf's registry.
+func TestAddPluginResolvesRow(t *testing.T) {
+	stub := writeStubAsdf(t, `
+if [ "$1" = "plugin" ] && [ "$2" = "list" ]; then
+  case "$3" in
+  --urls)
+    echo "my-tool  https://github.com/acme/asdf-demo.git"
+    echo "nodejs  https://github.com/nodejs/asdf-nodejs.git"
+    ;;
+  *) echo "nodejs" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "plugin" ] && [ "$2" = "add" ]; then
+  case "$3" in
+  nodejs|my-tool) echo added; exit 0 ;;
+  *) echo "unknown plugin: $3" >&2; exit 1 ;;
+  esac
+fi
+`)
+	defer stub()
+
+	// a name asdf's registry knows → not custom, repo taken from `plugin list --urls`
+	msg := addPluginCmd("nodejs", "")().(addPluginMsg)
+	if msg.err != nil {
+		t.Fatalf("add: %v", msg.err)
+	}
+	if msg.p.Custom {
+		t.Errorf("a registry plugin must not be flagged custom: %+v", msg.p)
+	}
+	if msg.p.Repo != "https://github.com/nodejs/asdf-nodejs.git" {
+		t.Errorf("repo should come from asdf, got %q", msg.p.Repo)
+	}
+
+	// a name only asdf can resolve from the URL → custom
+	msg = addPluginCmd("my-tool", "https://github.com/acme/asdf-demo.git")().(addPluginMsg)
+	if msg.err != nil {
+		t.Fatalf("add: %v", msg.err)
+	}
+	if !msg.p.Custom || msg.p.Repo != "https://github.com/acme/asdf-demo.git" {
+		t.Errorf("a repo-added plugin should be custom with its URL, got %+v", msg.p)
+	}
+
+	// a failing add is reported, not swallowed
+	msg = addPluginCmd("nope", "")().(addPluginMsg)
+	if msg.err == nil {
+		t.Errorf("a rejected add must report the error, got %+v", msg.p)
+	}
+}
+
+// writeStubAsdf puts a fake `asdf` first on PATH for the duration of the test
+// and returns the cleanup func.
+func writeStubAsdf(t *testing.T, body string) func() {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" + body + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "asdf"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	old := os.Getenv("PATH")
+	os.Setenv("PATH", dir+string(os.PathListSeparator)+old)
+	return func() { os.Setenv("PATH", old) }
 }

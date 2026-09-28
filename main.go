@@ -57,6 +57,10 @@ func cmdCatalogRefresh() {
 		fmt.Fprintln(os.Stderr, "cannot fetch plugin list:", err)
 		os.Exit(1)
 	}
+	// Custom plugins (added straight from a repo URL) are not in the
+	// registry, so merge them in before the walk — otherwise the diff below
+	// would flag them as removed from the catalog.
+	rows = withAddedPlugins(rows)
 	// Walk every repository in parallel and fill desc / archived / project
 	// (unavailable kept grey / unavailable). Offline-safe: each repo gets
 	// an 8s timeout and failures mark the row unavailable instead of
@@ -351,8 +355,11 @@ func usage() {
 	fmt.Println("                       add a plugin (asdf plugin add) and append to catalog")
 	fmt.Println("  asdf-tui catalog-refresh")
 	fmt.Println("                       rebuild the catalog from `asdf plugin list all`")
+	fmt.Println("                       plus every plugin added to asdf (custom repos)")
 	fmt.Println("\nCatalog: data/plugins.yaml in the checkout, or seeded from the")
 	fmt.Println("project repository into ~/.config/asdf-tui/data/plugins.yaml.")
+	fmt.Println("\nIn the TUI: ? opens the help dialog with the key map,")
+	fmt.Println("ctrl+p adds a plugin, ctrl+f filters the catalog.")
 	fmt.Println("\nRequires: asdf.")
 }
 
@@ -418,7 +425,9 @@ func main() {
 			fmt.Fprintln(os.Stderr, "catalog is empty:", catalogPath())
 			os.Exit(1)
 		}
-		runTUI(plugins, cwd)
+		// plugins added straight from a repo URL are missing from the
+		// registry-generated catalog — merge them in so they are browsable
+		runTUI(withAddedPlugins(plugins), cwd)
 	case "list":
 		cmdList()
 	case "update":

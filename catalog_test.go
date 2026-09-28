@@ -20,6 +20,7 @@ func TestCatalogRoundTrip(t *testing.T) {
 		{Name: "xcbeautify", Desc: "format tool", Repo: "cpisciotta/asdf-xcbeautify", Project: "https://github.com/cpisciotta/xcbeautify", Archived: true},
 		{Name: "kubectl", Desc: "kubectl plugin", Repo: "asdf-community/asdf-kubectl", Archived: false, Unavailable: true},
 		{Name: "gone", Desc: "", Repo: "owner/gone", Removed: true, Unavailable: true},
+		{Name: "prek", Desc: "pre-commit reimplementation in Rust", Repo: "https://github.com/a4z/asdf-prek.git", Custom: true},
 		{Name: "adr-tools", Desc: "adr-tools plugin", Repo: "td7x/asdf/adr-tools", Project: "https://github.com/npryce/adr-tools", ProjectDesc: "Architecture Decision Records (ADR) tooling"},
 	}
 
@@ -30,8 +31,8 @@ func TestCatalogRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadCatalogYAML: %v", err)
 	}
-	if len(out) != 4 {
-		t.Fatalf("round-trip lost plugins: got=%d want=4", len(out))
+	if len(out) != 5 {
+		t.Fatalf("round-trip lost plugins: got=%d want=5", len(out))
 	}
 
 	byName := map[string]Plugin{}
@@ -67,6 +68,57 @@ func TestCatalogRoundTrip(t *testing.T) {
 	}
 	if !g.Unavailable {
 		t.Errorf("removed plugin should also be unavailable: %+v", g)
+	}
+
+	// the custom flag survives, so a repo added by hand stays marked as such
+	p := byName["prek"]
+	if !p.Custom {
+		t.Errorf("Custom flag lost: %+v", p)
+	}
+	if p.Repo != "https://github.com/a4z/asdf-prek.git" {
+		t.Errorf("custom plugin repo lost: %q", p.Repo)
+	}
+}
+
+// TestCatalogDiffMerge proves cmdCatalogRefresh is non-destructive: a plugin
+// that disappears from `asdf plugin list all` is kept in the catalog with
+// Removed=true instead of being deleted.
+// TestMergeAddedPlugins proves a plugin added straight from a repo URL
+// (`asdf plugin add name URL`) is merged into the catalog: it is missing from
+// the asdf-plugins registry the catalog is generated from, so without the
+// merge it would never be listed. Its repo URL is carried over and the row is
+// marked Custom, while plugins already in the catalog stay untouched.
+func TestMergeAddedPlugins(t *testing.T) {
+	catalog := []Plugin{
+		{Name: "k9s", Desc: "Kubernetes CLI", Repo: "https://github.com/looztra/asdf-k9s.git"},
+		{Name: "kubectl"},
+	}
+	added := []Plugin{
+		{Name: "kubectl", Repo: "https://github.com/asdf-community/asdf-kubectl.git"},
+		{Name: "prek", Repo: "https://github.com/a4z/asdf-prek.git"},
+	}
+
+	out := mergeAddedPlugins(catalog, added)
+	if len(out) != 3 {
+		t.Fatalf("the custom plugin should be merged in, got %d rows: %v", len(out), pluginNames(out))
+	}
+	if strings.Join(pluginNames(out), ",") != "k9s,kubectl,prek" {
+		t.Fatalf("merged catalog should stay sorted, got %v", pluginNames(out))
+	}
+	prek := out[2]
+	if !prek.Custom || prek.Repo != "https://github.com/a4z/asdf-prek.git" {
+		t.Fatalf("custom row should carry the repo and the flag, got %+v", prek)
+	}
+	if prek.Removed || prek.Unavailable {
+		t.Fatalf("a custom plugin is not removed from the catalog, got %+v", prek)
+	}
+	// a plugin already in the catalog keeps its own data
+	if out[0].Desc != "Kubernetes CLI" || out[0].Custom {
+		t.Fatalf("catalog rows must not be rewritten, got %+v", out[0])
+	}
+	// merging twice adds nothing
+	if again := mergeAddedPlugins(out, added); len(again) != 3 {
+		t.Fatalf("merge must be idempotent, got %d rows", len(again))
 	}
 }
 
@@ -325,7 +377,7 @@ func TestRefreshActionWiring(t *testing.T) {
 	}
 
 	boom, _ := m.runAction(8)
-	if del, ok := boom.(*model); !ok || !del.confirmRm {
+	if del, ok := boom.(*model); !ok || del.cf == nil || del.cf.kind != confirmRemovePlugin {
 		t.Fatal("action 8 should trigger the remove confirmation")
 	}
 }

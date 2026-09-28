@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -80,6 +81,59 @@ func asdfPluginList() []string {
 			res = append(res, t)
 		}
 	}
+	return res
+}
+
+// asdfCurrentNames returns the tool names asdf prints in `asdf current`: every
+// added plugin, with the version currently in use (or "______" when none is
+// set). It is the "what is actually installed" list, so it also covers custom
+// plugins added straight from a repo URL — those never join the asdf-plugins
+// registry and are therefore missing from `asdf plugin list all`. Falls back to
+// `asdf plugin list` if the table cannot be read.
+func asdfCurrentNames() []string {
+	out, err := runCmd("current")
+	if err == nil {
+		if names := parseAsdfCurrent(out); len(names) > 0 {
+			return names
+		}
+	}
+	return asdfPluginList()
+}
+
+// parseAsdfCurrent decodes the `asdf current` table (Name / Version / Source /
+// Installed) down to the tool names, dropping the header row.
+func parseAsdfCurrent(out string) []string {
+	var res []string
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) == 0 || strings.EqualFold(fields[0], "Name") {
+			continue
+		}
+		res = append(res, fields[0])
+	}
+	return res
+}
+
+// asdfAddedPlugins returns every plugin added to asdf together with its
+// repository URL, decoded from `asdf plugin list --urls` and sorted by name.
+// This is the only asdf command that knows a custom plugin added with
+// `asdf plugin add name URL`, so it is what the catalog is merged with.
+func asdfAddedPlugins() []Plugin {
+	out, err := runCmd("plugin", "list", "--urls")
+	if err != nil {
+		return nil
+	}
+	var res []Plugin
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		res = append(res, Plugin{Name: fields[0], Repo: fields[1]})
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Name < res[j].Name })
 	return res
 }
 

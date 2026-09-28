@@ -7,8 +7,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -54,7 +56,7 @@ var filterOptions = []struct {
 }{
 	{filterAll, "all plugins"},
 	{filterAdded, "added to asdf"},
-	{filterActive, "active (not archived/removed/unreachable)"},
+	{filterActive, "active"},
 	{filterArchived, "archived"},
 	{filterRemoved, "removed"},
 	{filterUnreachable, "unreachable"},
@@ -154,6 +156,55 @@ func pluginIcon(p Plugin) string {
 	return ""
 }
 
+// confirmKind names the action an open confirmation is about, so the shared
+// modal can run the right task and word itself accordingly.
+type confirmKind int
+
+const (
+	confirmNone confirmKind = iota
+	confirmRemovePlugin
+	confirmUninstallVersion
+	confirmSelfUpdate
+)
+
+// button indexes of the yes/no pair in the confirmation modal.
+const (
+	btnYes = iota
+	btnNo
+)
+
+// confirm is the state behind the single yes/no modal every prompt goes
+// through: removing a plugin, uninstalling a version and the startup
+// self-update offer all render the same dialog, so an answer is always given
+// the same way. The highlight starts on "No" — a stray Enter must never
+// destroy an install.
+type confirm struct {
+	kind confirmKind
+	// target is what the question is about: the plugin name, the plugin and
+	// version, or the published release tag.
+	target string
+	// arg is the payload the action needs (the version to uninstall); it is
+	// empty for the kinds that act on the selected plugin or nothing at all.
+	arg string
+	sel int // btnYes or btnNo
+}
+
+// confirmCopy is the wording of the modal for each kind: a headline, the
+// question with its target and a dim line spelling out the consequence.
+func confirmCopy(c *confirm) (title, question, detail string) {
+	switch c.kind {
+	case confirmRemovePlugin:
+		return "🗑 remove plugin", "Remove " + c.target + "?", "unregisters the plugin and erases every version it installed"
+	case confirmUninstallVersion:
+		return "🗑 uninstall version", "Uninstall " + c.target + "?", "erases this installed version only, the plugin stays"
+	case confirmSelfUpdate:
+		return "⬆ asdf-tui update available",
+			"Install " + c.target + " now?",
+			"you are running " + version + " — the TUI exits and the installer takes over this terminal"
+	}
+	return "", "", ""
+}
+
 type statusMsg struct {
 	name string
 	st   toolSt
@@ -179,6 +230,14 @@ type pluginRefreshMsg struct {
 
 type refreshMsg struct{}
 
+// addPluginMsg reports the outcome of the "add a plugin" form: on success it
+// carries the catalog row to insert (repo URL and custom flag resolved from
+// asdf itself, so the row is accurate without a restart).
+type addPluginMsg struct {
+	p   Plugin
+	err error
+}
+
 type model struct {
 	plugins   []Plugin
 	tools     list.Model
@@ -193,31 +252,37 @@ type model struct {
 	verSel    int
 	verTop    int
 	pickVer   string
-	confirmRm bool
-	// confirmUninstall holds the installed version awaiting a y/n before the
-	// "Uninstall a version…" action removes it (version list, right column).
-	confirmUninstall string
-	busy             bool
-	busyLabel        string
-	spinner          spinner.Model
-	statusMsg        string
-	errMsg           string
-	width            int
-	height           int
-	lastSel          string
-	rootDir          string
-	filter           pluginFilter
-	filterOpen       bool
-	filterSel        int
+	// cf is the open confirmation (nil when no dialog is on screen): remove
+	// plugin, uninstall a version and the startup update offer all share it.
+	cf *confirm
+	// addOpen shows the "add a plugin" form; add holds its two inputs.
+	addOpen bool
+	add     addForm
+	// helpOpen shows the "?" dialog (about, catalog counters, key map). It has
+	// the lowest precedence, so it never covers another modal.
+	helpOpen  bool
+	busy      bool
+	busyLabel string
+	spinner   spinner.Model
+	statusMsg string
+	errMsg    string
+	width     int
+	height    int
+	lastSel   string
+	rootDir   string
+	// catalogFile is the YAML the TUI rewrites when it learns something new
+	// about a plugin (a refresh or a manual add). Resolved once at startup, so
+	// no render or key handler touches the filesystem for it.
+	catalogFile string
+	filter      pluginFilter
+	filterOpen  bool
+	filterSel   int
 	// warnOpen shows the startup warning modal when the asdf version manager
 	// itself is missing — the tool depends on it for every action.
 	warnOpen bool
-	// updateOpen shows the "new version available" modal at startup;
 	// doUpdate records a confirmed upgrade so runTUI can hand the terminal
 	// to the installer.
-	updateOpen   bool
-	updateLatest string
-	doUpdate     bool
+	doUpdate bool
 }
 
 var (
@@ -265,13 +330,17 @@ func newModelCheck(plugins []Plugin, rootDir string, asdfOK bool) model {
 	s.Spinner = spinner.Dot
 
 	m := model{
-		plugins:  plugins,
-		rootDir:  rootDir,
-		state:    map[string]toolSt{},
-		addedSet: map[string]bool{},
-		spinner:  s,
-		lastSel:  "",
-		warnOpen: !asdfOK,
+		plugins: plugins,
+		rootDir: rootDir,
+		// the refresh path, not catalogPath(): the write side must never seed
+		// itself from the network, and both resolve to the same file once the
+		// catalog has been loaded
+		catalogFile: catalogRefreshPath(),
+		state:       map[string]toolSt{},
+		addedSet:    map[string]bool{},
+		spinner:     s,
+		lastSel:     "",
+		warnOpen:    !asdfOK,
 	}
 	m.tools = list.New(items, delegate, 30, 20)
 	m.tools.SetShowStatusBar(false)
@@ -349,6 +418,72 @@ func refreshPluginCmd(p Plugin) tea.Cmd {
 	}
 }
 
+// addPluginCmd runs `asdf plugin add NAME [REPO]` for the "add a plugin" form
+// and resolves the resulting catalog row: the repo URL as asdf recorded it
+// (`asdf plugin list --urls`) and the custom flag from whether asdf's own
+// registry knows the name at all.
+func addPluginCmd(name, repo string) tea.Cmd {
+	return func() tea.Msg {
+		if err := asdfAddPlugin(name, repo); err != nil {
+			return addPluginMsg{p: Plugin{Name: name}, err: err}
+		}
+		p := Plugin{Name: name, Repo: repo}
+		for _, a := range asdfAddedPlugins() {
+			if a.Name == name && a.Repo != "" {
+				p.Repo = a.Repo
+				break
+			}
+		}
+		p.Custom = !asdfIsRegistryPlugin(name)
+		return addPluginMsg{p: p}
+	}
+}
+
+// asdfIsRegistryPlugin reports whether `asdf plugin list all` knows the name —
+// i.e. whether asdf could have resolved it without a repo URL.
+func asdfIsRegistryPlugin(name string) bool {
+	all, err := asdfPluginListAll()
+	if err != nil {
+		return false
+	}
+	for _, p := range all {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// mergePlugin inserts a freshly added plugin into the catalog slice, rebuilds
+// the list items and persists the YAML, so the new row survives the next start.
+// An existing row (a custom plugin that was in the catalog already) only
+// gains the resolved repo URL and custom flag.
+func (m *model) mergePlugin(p Plugin) error {
+	idx := -1
+	for i, e := range m.plugins {
+		if e.Name == p.Name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		m.plugins = append(m.plugins, p)
+		idx = len(m.plugins) - 1
+	} else {
+		m.plugins[idx].Repo, m.plugins[idx].Custom = p.Repo, p.Custom
+	}
+	sort.SliceStable(m.plugins, func(i, j int) bool { return m.plugins[i].Name < m.plugins[j].Name })
+	m.syncToolItems()
+	// keep the cursor on the new row so the actions column shows it right away
+	for i, e := range m.plugins {
+		if e.Name == p.Name {
+			m.tools.Select(i)
+			break
+		}
+	}
+	return saveCatalogYAML(m.catalogFile, m.plugins)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -362,9 +497,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 
+	case cursor.BlinkMsg:
+		if !m.addOpen {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		if m.add.field == 0 {
+			m.add.name, cmd = m.add.name.Update(msg)
+		} else {
+			m.add.repo, cmd = m.add.repo.Update(msg)
+		}
+		return m, cmd
+
+	case addPluginMsg:
+		m.busy = false
+		if msg.err != nil {
+			m.errMsg = "add " + msg.p.Name + ": " + strings.TrimSpace(msg.err.Error())
+			return m, nil
+		}
+		if err := m.mergePlugin(msg.p); err != nil {
+			m.errMsg = "added, but catalog save failed: " + err.Error()
+			return m, nil
+		}
+		m.errMsg = ""
+		m.statusMsg = "plugin " + msg.p.Name + " added to asdf"
+		return m, tea.Batch(func() tea.Msg { return refreshMsg{} }, stCmd(msg.p.Name))
+
 	case refreshMsg:
+		// "added to asdf" means what `asdf current` lists — every plugin
+		// asdf has, including custom ones added from a repo URL
 		m.addedSet = map[string]bool{}
-		for _, p := range asdfPluginList() {
+		for _, p := range asdfCurrentNames() {
 			m.addedSet[p] = true
 		}
 		return m, nil
@@ -415,7 +578,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.syncToolItems()
-		if err := saveCatalogYAML(catalogPath(), m.plugins); err != nil {
+		if err := saveCatalogYAML(m.catalogFile, m.plugins); err != nil {
 			m.errMsg = "refreshed, but catalog save failed: " + err.Error()
 			return m, nil
 		}
@@ -436,12 +599,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusActions
 			}
 			if strings.HasPrefix(msg.label, "Remove") {
-				m.confirmRm = false
+				m.cf = nil
 				m.mode = verNone
 				m.focus = focusActions
 			}
 			if strings.HasPrefix(msg.label, "Uninstall") {
-				m.confirmUninstall = ""
+				m.cf = nil
 				m.mode = verNone
 				m.focus = focusActions
 			}
@@ -457,8 +620,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case updateCheckMsg:
 		if msg.err == nil && updateAvailable(version, msg.latest) {
-			m.updateLatest = msg.latest
-			m.updateOpen = true
+			m.openConfirm(confirmSelfUpdate, msg.latest, "")
 		}
 		return m, nil
 
@@ -507,10 +669,6 @@ func (m model) keyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.updateOpen {
-		return m.updateModalKey(key)
-	}
-
 	if m.warnOpen {
 		switch key {
 		case "enter", "esc", "q", "ctrl+c":
@@ -523,24 +681,32 @@ func (m model) keyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.filterModalKey(key)
 	}
 
-	if m.confirmRm {
+	if m.cf != nil {
+		return m.confirmKey(key)
+	}
+
+	if m.addOpen {
+		return m.addKey(msg)
+	}
+
+	// the help dialog swallows every key — only a dismissal reaches the columns
+	if m.helpOpen {
 		switch key {
-		case "y", "Y":
-			return m.runRemove()
-		case "n", "N", "esc":
-			m.confirmRm = false
+		case "esc", "q", "?", "enter", " ":
+			m.helpOpen = false
 		}
 		return m, nil
 	}
 
-	if m.confirmUninstall != "" {
-		switch key {
-		case "y", "Y":
-			return m.runUninstall(m.confirmUninstall)
-		case "n", "N", "esc", "q":
-			m.confirmUninstall = ""
-		}
+	// help and "add a plugin" work in every column — but "?" stays a plain
+	// character while a search field is being typed into, so it never eats a
+	// keystroke the user meant for the filter.
+	if key == "?" && !m.typingFilter() {
+		m.helpOpen = true
 		return m, nil
+	}
+	if key == "ctrl+p" {
+		return m, m.openAdd()
 	}
 
 	switch m.focus {
@@ -574,9 +740,7 @@ func (m model) keyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// filter, otherwise the letter leaks into the remove confirmation while
 	// the user is looking for a plugin.
 	if key == "r" && m.tools.FilterInput.Value() == "" {
-		if m.selected() != nil {
-			m.confirmRm = true
-		}
+		m.openConfirm(confirmRemovePlugin, m.selName(), "")
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -859,34 +1023,20 @@ func overlayBox(under, box string, screenW int) string {
 	return strings.Join(ul, "\n")
 }
 
-// overlayLine overwrites the cell window [left, left+len(text)) of line with
+// overlayLine overwrites the cell window [left, left+width(text)) of line with
 // text and pads the result to the screen width, keeping the covered region
-// opaque (the modal box has a solid background). Wide glyphs on either side
-// are walked by cell width so the splice never lands mid-glyph.
+// opaque (the modal box has a solid background). The window is measured with
+// x-ansi, not rune by rune: a styled row carries colour escapes, whose bytes
+// are not cells, and counting them would move the dialog off-centre and push
+// the rest of the row past the right edge (the terminal then wraps that row
+// and every line under it shifts). Wide glyphs stay whole on both sides of
+// the splice, and the result is clipped to the screen so a row can never be
+// wider than the terminal.
 func overlayLine(line, text string, left, width int) string {
 	text = ansi.Truncate(text, width-left, "")
-	tr := []rune(text)
-	rr := []rune(line)
-	cellAt := func(cell int) int {
-		n := 0
-		for i, r := range rr {
-			if n >= cell {
-				return i
-			}
-			n += lipgloss.Width(string(r))
-		}
-		return len(rr)
-	}
-	start := cellAt(left)
-	after := left
-	for _, r := range tr {
-		after += lipgloss.Width(string(r))
-	}
-	rest := cellAt(after)
-	out := append([]rune{}, rr[:start]...)
-	out = append(out, tr...)
-	out = append(out, rr[rest:]...)
-	return pad(string(out), width)
+	head := ansi.Truncate(line, left, "")
+	rest := ansi.TruncateLeft(line, left+ansi.StringWidth(text), "")
+	return pad(ansi.Truncate(head+text+rest, width, ""), width)
 }
 
 // setFilter switches the tools-column subset, keeping the cursor on the
@@ -918,18 +1068,157 @@ func (m model) setFilter(f pluginFilter) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// updateModalKey handles the startup update prompt: y confirms and quits the
-// TUI so runTUI can hand the terminal to the installer; n/Esc dismisses and
-// the session keeps running.
-func (m model) updateModalKey(key string) (tea.Model, tea.Cmd) {
+// openConfirm arms the shared yes/no modal. An empty target means there is
+// nothing to act on (no plugin selected), so no dialog is opened at all.
+func (m *model) openConfirm(kind confirmKind, target, arg string) {
+	if target == "" {
+		return
+	}
+	m.cf = &confirm{kind: kind, target: target, arg: arg, sel: btnNo}
+}
+
+// confirmKey drives the shared yes/no modal: ←/→ (also h/l) jump to the button
+// on that side and tab cycles, y answers yes, n/Esc answer no and Enter runs
+// whatever is highlighted — "No" until the user moves it.
+func (m model) confirmKey(key string) (tea.Model, tea.Cmd) {
 	switch key {
-	case "y", "Y", "enter":
-		m.doUpdate = true
-		return m, tea.Quit
+	case "left", "h":
+		m.cf.sel = btnYes
+	case "right", "l":
+		m.cf.sel = btnNo
+	case "tab", "shift+tab":
+		// two buttons, so both wrap between them
+		if m.cf.sel == btnYes {
+			m.cf.sel = btnNo
+		} else {
+			m.cf.sel = btnYes
+		}
+	case "y", "Y":
+		m.cf.sel = btnYes
+		return m.confirmAccept()
 	case "n", "N", "esc", "q":
-		m.updateOpen = false
+		m.cf = nil
+		return m, nil
+	case "enter", " ":
+		if m.cf.sel == btnNo {
+			m.cf = nil
+			return m, nil
+		}
+		return m.confirmAccept()
 	}
 	return m, nil
+}
+
+// confirmAccept runs the action behind the open confirmation and closes the
+// dialog first, so a slow task never leaves a prompt on screen.
+func (m model) confirmAccept() (tea.Model, tea.Cmd) {
+	kind, arg := m.cf.kind, m.cf.arg
+	m.cf = nil
+	switch kind {
+	case confirmRemovePlugin:
+		return m.runRemove()
+	case confirmUninstallVersion:
+		return m.runUninstall(arg)
+	case confirmSelfUpdate:
+		// the TUI is fully torn down after tea.Quit, so runTUI can hand the
+		// terminal to the installer
+		m.doUpdate = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+// typingFilter reports whether a search field currently swallows printable
+// keys: the tools-column list filter, or the versions-column filter. The
+// actions column has none, so a leftover tools search does not block the help
+// there.
+func (m model) typingFilter() bool {
+	switch m.focus {
+	case focusVersions:
+		return m.verFilter != ""
+	case focusActions:
+		return false
+	}
+	return m.tools.FilterInput.Value() != ""
+}
+
+// addForm is the "add a plugin" dialog: a plugin name and an optional repo URL,
+// exactly what `asdf plugin add NAME [REPO]` takes. Tab/↑/↓ move between the
+// two fields, Enter adds, Esc cancels.
+type addForm struct {
+	name  textinput.Model
+	repo  textinput.Model
+	field int    // 0 = name, 1 = repo
+	err   string // validation complaint shown in place of the hints
+}
+
+func newAddForm() addForm {
+	name := textinput.New()
+	name.Prompt = "name  "
+	name.Placeholder = "kubectl"
+	name.Width = 28
+	name.CharLimit = 64
+
+	repo := textinput.New()
+	repo.Prompt = "repo  "
+	repo.Placeholder = "https://github.com/user/asdf-tool.git"
+	repo.Width = 44
+	repo.CharLimit = 256
+
+	return addForm{name: name, repo: repo}
+}
+
+// openAdd arms the form with fresh inputs, focus on the name field, and
+// returns the cursor blink command that starts the field animation.
+func (m *model) openAdd() tea.Cmd {
+	m.add = newAddForm()
+	m.addOpen = true
+	return m.add.name.Focus()
+}
+
+// focusField moves the form focus to field i and returns the new blink command.
+func (a *addForm) focusField(i int) tea.Cmd {
+	a.field = i
+	a.err = ""
+	if i == 0 {
+		a.repo.Blur()
+		return a.name.Focus()
+	}
+	a.name.Blur()
+	return a.repo.Focus()
+}
+
+// addKey drives the "add a plugin" form: Tab/↑/↓ switch fields, Enter runs
+// `asdf plugin add`, Esc cancels. Everything else is typed into the focused
+// field.
+func (m model) addKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.addOpen = false
+		return m, nil
+	case "tab", "shift+tab", "up", "down":
+		return m, m.add.focusField((m.add.field + 1) % 2)
+	case "enter":
+		// asdf plugin names are single words
+		name := strings.Join(strings.Fields(m.add.name.Value()), "")
+		if name == "" {
+			m.add.err = "plugin name is required"
+			return m, nil
+		}
+		repo := strings.TrimSpace(m.add.repo.Value())
+		m.addOpen = false
+		m.busy = true
+		m.busyLabel = "Adding plugin " + name
+		m.statusMsg, m.errMsg = "", ""
+		return m, addPluginCmd(name, repo)
+	}
+	var cmd tea.Cmd
+	if m.add.field == 0 {
+		m.add.name, cmd = m.add.name.Update(msg)
+	} else {
+		m.add.repo, cmd = m.add.repo.Update(msg)
+	}
+	return m, cmd
 }
 
 // filterModalKey handles keys while the ctrl+f filter chooser is open.
@@ -973,9 +1262,7 @@ func (m *model) actionsKey(key string) (tea.Model, tea.Cmd) {
 	case "enter", " ":
 		return m.runAction(m.selAct)
 	case "r":
-		if m.selected() != nil {
-			m.confirmRm = true
-		}
+		m.openConfirm(confirmRemovePlugin, m.selName(), "")
 	}
 	return m, nil
 }
@@ -1053,7 +1340,12 @@ func (m *model) versionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = verScope
 				m.selScope = 0
 			case verUninstall:
-				m.confirmUninstall = f[m.verSel]
+				ver := f[m.verSel]
+				name := m.selName()
+				if name == "" {
+					name = "plugin"
+				}
+				m.openConfirm(confirmUninstallVersion, name+" "+ver, ver)
 			}
 		}
 	case "l", "L":
@@ -1271,14 +1563,14 @@ func (m *model) runSetDefaultTask(name, version, sc, dir string) (tea.Model, tea
 	})
 }
 
+// runRemove unregisters the selected plugin, erasing every version it
+// installed. The caller (the confirmation modal) has already validated it.
 func (m *model) runRemove() (tea.Model, tea.Cmd) {
 	p := m.selected()
 	if p == nil {
-		m.confirmRm = false
 		return m, nil
 	}
 	name := p.Name
-	m.confirmRm = false
 	m.busy = true
 	m.busyLabel = "Removing plugin " + name
 	m.statusMsg = ""
@@ -1288,16 +1580,14 @@ func (m *model) runRemove() (tea.Model, tea.Cmd) {
 	})
 }
 
-// runUninstall removes one installed version of the selected tool after the
-// user confirmed it in the versions column (`asdf uninstall <name> <version>`).
+// runUninstall erases one installed version of the selected tool
+// (`asdf uninstall <name> <version>`) after the confirmation modal cleared it.
 func (m *model) runUninstall(ver string) (tea.Model, tea.Cmd) {
 	p := m.selected()
 	if p == nil {
-		m.confirmUninstall = ""
 		return m, nil
 	}
 	name := p.Name
-	m.confirmUninstall = ""
 	m.busy = true
 	m.busyLabel = "Uninstalling " + name + " " + ver
 	m.statusMsg = ""
@@ -1366,7 +1656,7 @@ func (m *model) runAction(i int) (tea.Model, tea.Cmd) {
 		m.errMsg = ""
 		return m, refreshPluginCmd(*p)
 	case 8:
-		m.confirmRm = true
+		m.openConfirm(confirmRemovePlugin, p.Name, "")
 	}
 	return m, nil
 }
@@ -1405,28 +1695,159 @@ func (m model) View() string {
 
 	footer := m.statusLine()
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-	switch {
-	case m.updateOpen:
-		screen = overlayBox(screen, m.renderUpdateModal(), m.width)
-	case m.warnOpen:
-		screen = overlayBox(screen, m.renderWarnModal(), m.width)
-	case m.filterOpen:
-		screen = overlayBox(screen, m.renderFilterModal(), m.width)
+	if modal := m.activeModal(); modal != "" {
+		screen = overlayBox(screen, modal, m.width)
 	}
 	return screen
 }
 
-// renderUpdateModal draws the startup prompt shown when GitHub lists a newer
-// asdf-tui than the stamped build: opting in closes the TUI and lets the
-// installer take over the terminal.
-func (m model) renderUpdateModal() string {
+// activeModal returns the dialog drawn over the columns, "" when nothing
+// covers the screen. Only one is ever shown at a time; the startup warning and
+// the filter chooser outrank a confirmation, so the first screen of a session
+// (asdf missing) is never hidden behind a question. The "?" help is last: it
+// never covers another modal.
+func (m model) activeModal() string {
+	switch {
+	case m.warnOpen:
+		return m.renderWarnModal()
+	case m.filterOpen:
+		return m.renderFilterModal()
+	case m.cf != nil:
+		return m.renderConfirmModal()
+	case m.addOpen:
+		return m.renderAddModal()
+	case m.helpOpen:
+		return m.renderHelpModal()
+	}
+	return ""
+}
+
+// renderConfirmModal draws the shared yes/no dialog: the headline, the
+// question with its target, the consequence, and the two buttons with the
+// highlighted one inverted. ←/→ move the highlight, Enter runs it — "No" is
+// where it starts.
+func (m model) renderConfirmModal() string {
+	title, question, detail := confirmCopy(m.cf)
+	head := styleBrand
+	if m.cf.kind != confirmSelfUpdate {
+		head = styleErr
+	}
+	btn := func(label string, idx int) string {
+		if m.cf.sel == idx {
+			return styleHighlight.Render(" " + label + " ")
+		}
+		return styleDim.Render(" " + label + " ")
+	}
+	buttons := pad(btn("Yes", btnYes)+"  "+btn("No", btnNo), lipgloss.Width(question))
+
 	var b strings.Builder
-	b.WriteString(styleBrand.Render(" ⬆ asdf-tui update available ") + "\n\n")
-	b.WriteString("New version " + m.updateLatest + " is out,\n")
-	b.WriteString("you are running " + version + ".\n\n")
-	b.WriteString("Install it now? The TUI exits and the\n")
-	b.WriteString("installer takes over this terminal.\n\n")
-	b.WriteString(styleDim.Render("y / Enter — install · n / Esc — stay"))
+	b.WriteString(head.Render(" "+title) + "\n\n")
+	b.WriteString(question + "\n")
+	b.WriteString(styleDim.Render(detail) + "\n\n")
+	b.WriteString(buttons + "\n\n")
+	b.WriteString(styleDim.Render("←/→ pick · Enter run · y yes · n/Esc no"))
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("86")).
+		Padding(0, 1).
+		Render(b.String())
+}
+
+// renderAddModal draws the "add a plugin" form over the columns: the two
+// inputs, a note on when the repo URL is needed and the key hints.
+func (m model) renderAddModal() string {
+	var b strings.Builder
+	b.WriteString(styleBrand.Render(" ➕ add plugin") + "\n\n")
+	b.WriteString(m.add.name.View() + "\n")
+	b.WriteString(m.add.repo.View() + "\n\n")
+	b.WriteString(styleDim.Render("repo is optional: leave it empty to take a") + "\n")
+	b.WriteString(styleDim.Render("registry plugin, pass a URL to add your own.") + "\n\n")
+	if m.add.err != "" {
+		b.WriteString(styleErr.Render(m.add.err))
+	} else {
+		b.WriteString(styleDim.Render("Tab / ↑↓ field · Enter add · Esc cancel"))
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("86")).
+		Padding(0, 1).
+		Render(b.String())
+}
+
+// helpKeyLines is the key map of the "?" dialog: one "keys — what" row per
+// group, prefixed with the column the keys belong to. A blank line separates
+// the groups.
+func helpKeyLines() []string {
+	row := func(scope, keys, what string) string {
+		return styleDim.Render(pad(scope, 9)) + styleBrand.Render(pad(keys, 17)) + what
+	}
+	return []string{
+		row("any", "?", "this help"),
+		row("any", "ctrl+p", "add a plugin (name + repo)"),
+		row("any", "ctrl+f", "filter the catalog"),
+		row("any", "r", "remove the plugin (asks)"),
+		row("any", "q / esc", "quit · clear search · back"),
+		"",
+		row("tools", "type", "search names, apps, urls"),
+		row("tools", "↑/↓ j/k", "move · Enter → actions"),
+		row("actions", "↑/↓ j/k", "move · 1-9 pick · run"),
+		row("versions", "type /", "filter the version list"),
+		row("versions", "↑/↓ j/k", "move · PgUp/PgDn pages"),
+		row("versions", "enter / L", "run · install latest"),
+		"",
+		row("forms", "ctrl+p / Esc", "add plugin / close a dialog"),
+		row("dialogs", "←/→ h/l", "pick Yes / No · Tab"),
+		row("dialogs", "y / n", "answer · Enter runs it"),
+	}
+}
+
+// helpStats is the catalog counter line of the help dialog: how many plugins
+// the column holds, how many are installed in asdf versus still available, and
+// how many of them are custom (added from a repo URL).
+func (m model) helpStats() string {
+	custom := 0
+	for _, p := range m.plugins {
+		if p.Custom {
+			custom++
+		}
+	}
+	installed := 0
+	for _, p := range m.plugins {
+		if m.addedSet[p.Name] {
+			installed++
+		}
+	}
+	s := fmt.Sprintf("%d plugins · %d installed in asdf · %d available",
+		len(m.plugins), installed, len(m.plugins)-installed)
+	if custom > 0 {
+		s += fmt.Sprintf(" · %d custom", custom)
+	}
+	return s
+}
+
+// renderHelpModal draws the "?" dialog: what the program is, what the catalog
+// currently holds and the full key map. The key map is laid out in two
+// side-by-side columns when one long list would not fit the terminal height
+// (and the width is there for it), so the dialog always stays on screen.
+func (m model) renderHelpModal() string {
+	keys := helpKeyLines()
+	// title, blank, stats, description, blank, hints, border + padding
+	if len(keys)+11 > m.height {
+		half := (len(keys) + 1) / 2
+		head := strings.Join(keys[:half], "\n")
+		left := lipgloss.NewStyle().Width(lipgloss.Width(head) + 1).Render(head)
+		right := strings.Join(keys[half:], "\n")
+		keys = []string{lipgloss.JoinHorizontal(lipgloss.Top, left, right)}
+	}
+
+	var b strings.Builder
+	b.WriteString(styleBrand.Render(" ? asdf-tui "+version) +
+		styleDim.Render(" — column TUI for asdf-managed tools") + "\n\n")
+	b.WriteString(m.helpStats() + "\n")
+	b.WriteString(styleDim.Render("the asdf-plugins registry list, plus the plugins") + "\n")
+	b.WriteString(styleDim.Render("added to this machine from a repo URL.") + "\n\n")
+	b.WriteString(strings.Join(keys, "\n") + "\n\n")
+	b.WriteString(styleDim.Render("Esc / ? — close"))
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("86")).
@@ -1463,7 +1884,30 @@ func (m model) headerHints() string {
 	case m.focus == focusVersions:
 		return "right column — " + verModeName(m.mode)
 	}
-	return "tools — " + m.filterLabel() + " · type to search"
+	return "tools — " + m.catalogSummary() + " · type to search"
+}
+
+// catalogSummary describes what the tools column holds, for the header: how
+// many plugins it lists, how many of those are custom (added straight from a
+// repo URL, so absent from the asdf-plugins registry) and, while a subset is
+// filtered, how many rows that subset leaves.
+func (m model) catalogSummary() string {
+	custom := 0
+	for _, p := range m.plugins {
+		if p.Custom {
+			custom++
+		}
+	}
+	var s string
+	if m.filter == filterAll {
+		s = fmt.Sprintf("%d plugins", len(m.plugins))
+	} else {
+		s = fmt.Sprintf("%s · %d of %d", m.filterLabel(), len(m.filteredPlugins()), len(m.plugins))
+	}
+	if custom > 0 {
+		s += fmt.Sprintf(" (%d custom)", custom)
+	}
+	return s
 }
 
 func verModeName(v verMode) string {
@@ -1504,15 +1948,6 @@ func (m model) renderTools(w, h int) string {
 }
 
 func (m model) renderActions(w, h int) string {
-	if m.confirmRm {
-		p := m.selected()
-		name := "plugin"
-		if p != nil {
-			name = p.Name
-		}
-		return styleErr.Render("Remove plugin "+name+"\n(erases all its versions)?") +
-			"\n\n  " + styleOk.Render("y") + " yes    " + styleDim.Render("n") + " no"
-	}
 	var b strings.Builder
 	// fixed-height info block: name, app description, repo status, plugin +
 	// project descriptions with their links. It always occupies the same
@@ -1668,17 +2103,6 @@ func (m model) renderRight(w, h int) string {
 }
 
 func (m model) renderVersions(w, h int) string {
-	if m.confirmUninstall != "" {
-		name := "..."
-		if p := m.selected(); p != nil {
-			name = p.Name
-		}
-		var b strings.Builder
-		b.WriteString(styleErr.Render("Uninstall "+name+" "+m.confirmUninstall+"?") + "\n")
-		b.WriteString(styleDim.Render("removes the installed version") + "\n\n")
-		b.WriteString("  " + styleOk.Render("y") + " yes    " + styleDim.Render("n") + " no")
-		return b.String()
-	}
 	var b strings.Builder
 	title := "install a version"
 	switch m.mode {
@@ -1770,22 +2194,24 @@ func (m model) statusLine() string {
 	switch {
 	case m.busy:
 		b.WriteString(styleBrand.Render(" running: ") + m.busyLabel + "\n")
-	case m.confirmUninstall != "":
-		b.WriteString(styleDim.Render(" y — confirm uninstall · n — cancel") + "\n")
-	case m.focus == focusActions && !m.confirmRm:
-		b.WriteString(styleDim.Render(" ↑/↓ · j/k · 1-9 pick · Enter run · Esc back to tools") + "\n")
+	case m.cf != nil:
+		b.WriteString(styleDim.Render(" ←/→ pick · Enter run · y yes · n/Esc no") + "\n")
+	case m.addOpen:
+		b.WriteString(styleDim.Render(" Tab / ↑↓ field · Enter add · Esc cancel · ctrl+p anywhere") + "\n")
+	case m.helpOpen:
+		b.WriteString(styleDim.Render(" ? — about, catalog counters, key map · Esc close") + "\n")
+	case m.focus == focusActions:
+		b.WriteString(styleDim.Render(" ↑/↓ · j/k · 1-9 pick · Enter run · Esc back to tools · ? help") + "\n")
 	case m.focus == focusVersions:
 		if m.mode == verScope {
-			b.WriteString(styleDim.Render(" ↑/↓ pick · Enter run · Esc back") + "\n")
+			b.WriteString(styleDim.Render(" ↑/↓ pick · Enter run · Esc back · ? help") + "\n")
 		} else if m.mode == verUninstall {
-			b.WriteString(styleDim.Render(" Enter uninstall · / letters filter · PgUp/PgDn pages · Esc clear/back") + "\n")
+			b.WriteString(styleDim.Render(" Enter uninstall · / letters filter · PgUp/PgDn pages · Esc clear/back · ? help") + "\n")
 		} else {
-			b.WriteString(styleDim.Render(" Enter install · L latest · / letters filter · PgUp/PgDn pages · Esc clear/back") + "\n")
+			b.WriteString(styleDim.Render(" Enter install · L latest · / filter · PgUp/PgDn pages · ? help") + "\n")
 		}
-	case m.confirmRm:
-		b.WriteString(styleDim.Render(" y — confirm removal · n — cancel") + "\n")
 	default:
-		b.WriteString(styleDim.Render(" type to search names, apps, urls · ↑/↓ move · Enter pick · Esc clear filter") + "\n")
+		b.WriteString(styleDim.Render(" type to search names/apps/urls · ↑/↓ move · Enter pick · ? help · ctrl+p add") + "\n")
 	}
 	if m.errMsg != "" {
 		b.WriteString(styleErr.Render(" ✗ "+m.errMsg) + "\n")
