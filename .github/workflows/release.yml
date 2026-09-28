@@ -9,6 +9,10 @@
 #   workflow_dispatch   ->  build 1.2.3-{alpha|beta|rc}.<run#>   artifact only
 #   push on main        ->  build 1.2.4 + git tag + GitHub Release   (the merge)
 #
+# A push to main is a patch bump. Put [minor] or [major] in the merge commit
+# message (GitHub copies the PR title into the merge message body, so a marker
+# in the title is enough) to bump further; next-version.sh reads it there.
+#
 # The pull_request and push triggers are `paths`-filtered: the binary only
 # depends on the Go sources, so a docs/catalog/CI-only change is never
 # rebuilt nor released (docs/CI-only merges do not bump the version).
@@ -51,6 +55,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # the script below decides every released version, so its rules are
+      # tested before anything depends on them
+      - name: Test the version rules
+        run: .github/scripts/next-version_test.sh
+
       - name: Resolve version from git
         id: resolve
         env:
@@ -63,6 +72,10 @@ jobs:
             workflow_dispatch)
               V="$(.github/scripts/next-version.sh for-dispatch "${{ github.event.inputs.prerelease }}")" ;;
             push)
+              # The bump kind comes from the merge commit: a plain merge is a
+              # patch, a message containing [minor] or [major] bumps that far.
+              # Add the marker to the PR title or the merge message box and
+              # the release becomes 0.2.0 / 1.0.0 with no edit here.
               V="$(.github/scripts/next-version.sh for-merge)" ;;
           esac
           echo "version=$V" >> "$GITHUB_OUTPUT"
