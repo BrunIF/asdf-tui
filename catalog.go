@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,7 +19,7 @@ type Plugin struct {
 	// AppDesc is a short, name-only description of the utility itself
 	// (curated, not re-derived from the forge), shown when available.
 	AppDesc string
-	Repo string
+	Repo    string
 	// Unavailable marks a plugin whose repository could not be reached
 	// during catalog refresh (network error, removed plugin, rate-limit).
 	// The TUI greys these rows out.
@@ -30,6 +31,11 @@ type Plugin struct {
 	// listed by `asdf plugin list all`. It is kept (not deleted) so the
 	// TUI can draw a deletion icon after its name.
 	Removed bool
+	// Custom marks a plugin added straight from a repo URL
+	// (`asdf plugin add name URL`). Such a repo is not part of the
+	// asdf-plugins registry the catalog is generated from, so its row is
+	// merged in from asdf itself instead.
+	Custom bool
 	// Project is the upstream project this plugin wraps, discovered by
 	// scanning the plugin's README for the first `[label](http…)` link
 	// (e.g. asdf-xcbeautify → https://github.com/cpisciotta/xcbeautify).
@@ -42,6 +48,41 @@ type Plugin struct {
 
 func loadCatalog(path string) ([]Plugin, error) {
 	return loadCatalogYAML(path)
+}
+
+// withAddedPlugins returns the catalog with every plugin asdf knows about but
+// the YAML never heard of merged in. A custom repo added with
+// `asdf plugin add name URL` is not in the asdf-plugins registry, so a
+// registry-generated catalog (and `asdf plugin list all`) would never list it.
+// The repo URL comes from `asdf plugin list --urls`, so the row behaves like
+// any other: install, refresh and remove all work on it.
+func withAddedPlugins(plugins []Plugin) []Plugin {
+	return mergeAddedPlugins(plugins, asdfAddedPlugins())
+}
+
+// mergeAddedPlugins appends the added plugins missing from the catalog, marked
+// Custom. Plugins already in the catalog are left untouched (they keep the
+// description and flags the catalog walk found for them). When anything was
+// merged the result is sorted by name again, so the custom rows do not pile up
+// at the bottom of an otherwise alphabetical column.
+func mergeAddedPlugins(plugins, added []Plugin) []Plugin {
+	have := make(map[string]bool, len(plugins))
+	for _, p := range plugins {
+		have[p.Name] = true
+	}
+	merged := false
+	for _, p := range added {
+		if have[p.Name] {
+			continue
+		}
+		have[p.Name] = true
+		merged = true
+		plugins = append(plugins, Plugin{Name: p.Name, Repo: p.Repo, Custom: true})
+	}
+	if merged {
+		sort.SliceStable(plugins, func(i, j int) bool { return plugins[i].Name < plugins[j].Name })
+	}
+	return plugins
 }
 
 func loadCatalogYAML(path string) ([]Plugin, error) {
@@ -75,6 +116,8 @@ func loadCatalogYAML(path string) ([]Plugin, error) {
 			cur.Archived = strings.TrimSpace(strings.TrimPrefix(t, "archived:")) == "true"
 		} else if strings.HasPrefix(t, "removed:") {
 			cur.Removed = strings.TrimSpace(strings.TrimPrefix(t, "removed:")) == "true"
+		} else if strings.HasPrefix(t, "custom:") {
+			cur.Custom = strings.TrimSpace(strings.TrimPrefix(t, "custom:")) == "true"
 		} else if strings.HasPrefix(t, "desc:") {
 			cur.Desc = yamlUnquote(strings.TrimSpace(strings.TrimPrefix(t, "desc:")))
 		} else if strings.HasPrefix(t, "app_desc:") {
@@ -103,7 +146,7 @@ func yamlUnquote(s string) string {
 func saveCatalogYAML(path string, plugins []Plugin) error {
 	var b strings.Builder
 	b.WriteString("# asdf-tui plugin catalog\n")
-	b.WriteString("# regenerated from `asdf plugin list all`\n")
+	b.WriteString("# regenerated from `asdf plugin list all` and the plugins added to asdf\n")
 	b.WriteString("plugins:\n")
 	for _, p := range plugins {
 		b.WriteString("- name: " + yamlScalar(p.Name) + "\n")
@@ -115,6 +158,9 @@ func saveCatalogYAML(path string, plugins []Plugin) error {
 		}
 		if p.Removed {
 			b.WriteString("  removed: true\n")
+		}
+		if p.Custom {
+			b.WriteString("  custom: true\n")
 		}
 		b.WriteString("  desc: " + yamlScalar(p.Desc) + "\n")
 		if p.AppDesc != "" {

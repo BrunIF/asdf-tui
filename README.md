@@ -87,7 +87,10 @@ stays paced and anonymous.
 ## TUI columns and keys
 
 The header shows the running asdf-tui version next to the app name (`dev` for
-hand-built binaries, the stamped release version otherwise).
+hand-built binaries, the stamped release version otherwise) and, in the tools
+column, what the column holds: `tools — 846 plugins (1 custom) · type to
+search`, or `tools — added · 15 of 846 (1 custom) · type to search` while a
+subset is filtered.
 
 **Left column — tools catalog.** Just start typing; the list filters live.
 `↑/↓`, `j/k` navigate. `r` remove (asks for confirmation). `q` quits (when the
@@ -95,6 +98,89 @@ search field is empty); `Esc` clears the search. `Enter` moves to the actions
 column. The list title keeps the active search visible, for example
 `List · filter: kubernetes`. Rows show just the name plus a state icon: `🔒`
 archived repo, `🗑` dropped from the catalog, `🚫` unreachable.
+
+**Keys that work in every column:** `?` help, `ctrl+p` add a plugin,
+`ctrl+f` filter the catalog, `r` remove the selected plugin, `q`/`Esc` quit /
+walk back.
+
+**Custom plugins.** A plugin added straight from a repo URL
+(`asdf plugin add prek https://github.com/a4z/asdf-prek.git`) never joins the
+asdf-plugins registry, so it is missing from `asdf plugin list all` and from the
+generated catalog. asdf-tui merges those in from `asdf plugin list --urls` on
+every start (and before `catalog-refresh`), keeps the repo URL so install /
+refresh / remove work, and counts them separately as `custom` in the header.
+The **added to asdf** subset is exactly what `asdf current` lists, so it covers
+custom plugins too.
+
+**Confirmations.** Anything that destroys something — removing a plugin,
+uninstalling a version, installing an asdf-tui update — asks in the same modal
+dialog centered over the whole TUI, never inline in a column:
+
+```text
+╭──────────────────────────────────────────────────────────────╮
+│  🗑 remove plugin                                             │
+│                                                              │
+│ Remove nodejs?                                               │
+│ unregisters the plugin and erases every version it installed │
+│                                                              │
+│  Yes    No                                                   │
+│                                                              │
+│ ←/→ pick · Enter run · y yes · n/Esc no                      │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+`←/→` (or `h`/`l`, or `Tab`) move the highlight, `Enter` runs whatever is
+highlighted, `y` answers yes and `n`/`Esc` answer no. The highlight starts on
+**No**, so a stray `Enter` never deletes an install.
+
+**Adding a plugin (`ctrl+p`).** `ctrl+p` works in every column and opens a
+two-field form over the screen center, running the same
+`asdf plugin add NAME [REPO]` action #3 does for a selected row:
+
+```text
+╭─────────────────────────────────────────────────────╮
+│  ➕ add plugin                                      │
+│                                                     │
+│ name  prek                                          │
+│ repo  https://github.com/a4z/asdf-prek.git          │
+│                                                     │
+│ repo is optional: leave it empty to take a          │
+│ registry plugin, pass a URL to add your own.        │
+│                                                     │
+│ Tab / ↑↓ field · Enter add · Esc cancel             │
+╰─────────────────────────────────────────────────────╯
+```
+
+`Tab`/`↑`/`↓` move between the fields, `Enter` runs the add, `Esc` cancels. The
+repo URL is optional: leave it empty and asdf resolves the name in its own
+registry, pass a URL and the plugin is added from that repo. On success the new
+row is merged into the catalog (marked `custom` when asdf's registry does not
+know the name), saved to the YAML and selected, so the next start keeps it.
+
+**Help (`?`).** `?` opens a modal with what the program is, the catalog counters
+(plugins, installed in asdf, still available, custom ones) and the full key map:
+
+```text
+╭─────────────────────────────────────────────────────────────╮
+│  ? asdf-tui dev — column TUI for asdf-managed tools         │
+│                                                             │
+│ 846 plugins · 15 installed in asdf · 831 available · 1 custom│
+│ any      ?                this help                          │
+│ any      ctrl+p           add a plugin (name + repo)        │
+│ any      ctrl+f           filter the catalog                │
+│ any      r                remove the plugin (asks)          │
+│ any      q / esc          quit · clear search · back        │
+│ ...                                                        │
+│ Esc / ? — close                                             │
+╰─────────────────────────────────────────────────────────────╯
+```
+
+`?` works in every column, but stays a plain character while a search field is
+being typed into — it never eats a keystroke of a search. `Esc`, `?` or `q`
+closes it. It has the lowest precedence of all dialogs: it never covers the
+warning, the filter chooser, a confirmation or the add form. On a short
+terminal the key map folds into two side-by-side columns so the dialog stays on
+screen.
 
 **Filtering the catalog (`ctrl+f`).** The columns can be narrowed to a subset
 of the catalog; the type-to-search filter keeps working on top of the subset.
@@ -105,11 +191,15 @@ filter):
 | Subset          |
 | --------------- |
 | all plugins     |
-| added to asdf   |
+| added to asdf (what `asdf current` lists) |
 | active (not archived/removed/unreachable) |
 | archived (`🔒`) |
 | removed (`🗑`)  |
 | unreachable (`🚫`) |
+
+The chooser lists the six subsets under short names (`all plugins`, `added to
+asdf`, `active`, `archived`, `removed`, `unreachable`); the meanings above are
+spelled out here.
 
 Switching subsets keeps the cursor on the currently selected plugin when it
 survives (otherwise it jumps to the first visible row) and clears the
@@ -133,7 +223,7 @@ fixed-size and every line has its own slot, the action list below never jumps.
 | 2 | Install the latest stable version |
 | 3 | Add plugin — `asdf plugin add NAME [REPO]` (needed before the version list can be fetched) |
 | 4 | Set a default version — pick an **installed** version, then a scope |
-| 5 | Uninstall a version — pick an **installed** version, confirm with `y` |
+| 5 | Uninstall a version — pick an **installed** version, confirm in the modal |
 | 6 | Update the plugin |
 | 7 | Reshim |
 | 8 | Refresh plugin info — re-fetch desc/archived/project for this plugin (same rate-limit → README fallback as `catalog-refresh`) and save to the YAML catalog |
@@ -142,7 +232,7 @@ fixed-size and every line has its own slot, the action list below never jumps.
 **Right column — versions.** `↑/↓`, `j/k` navigate, `PgUp/PgDn` turn pages
 (●/· indicator under the list). Letters filter live; `/` restarts the filter,
 `Esc` clears it (or walks back through the columns: versions → actions →
-tools). `Enter` runs the chosen action; uninstall asks a `y`/`n` confirmation
+tools). `Enter` runs the chosen action; uninstall opens the confirmation modal
 first.
 
 Setting a default offers two scopes (pick with `↑/↓`, confirm with `Enter`):
