@@ -21,11 +21,17 @@ os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in
   x86_64|amd64)  arch="amd64" ;;
   aarch64|arm64) arch="arm64" ;;
-  *) die "unsupported architecture: $(uname -m) (only amd64/arm64)" ;;
+  i386|i486|i586|i686)
+    # 32-bit x86 exists for Linux only — there is no darwin/386 build
+    arch="386" ;;
+  *) die "unsupported architecture: $(uname -m) (only amd64/arm64/386)" ;;
 esac
 
 case "$os" in
-  linux|darwin) : ;;
+  linux) : ;;
+  darwin)
+    [ "$arch" != "386" ] || die "there is no 32-bit macOS build"
+    : ;;
   *) die "unsupported OS: $os (only linux/darwin)" ;;
 esac
 

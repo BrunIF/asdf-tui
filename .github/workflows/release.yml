@@ -72,12 +72,15 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
+        # darwin/386 does not exist, everything else is a plain CGO_ENABLED=0
+        # cross build. 386 is kept for the 32-bit Linux boxes asdf still runs on.
+        goos: [linux, darwin]
+        goarch: ["386", amd64, arm64]
+        exclude:
+          - goos: darwin
+            goarch: "386"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -97,17 +100,35 @@ jobs:
             -o "$out" .
           echo "name=$(basename "$out")" >> "$GITHUB_OUTPUT"
 
+      # Only the runner's own target can be executed here (linux/amd64); every
+      # other binary — including linux/386 on a 64-bit runner — is checked by
+      # looking for the stamped string in it.
       - name: Verify the stamped version
-        if: matrix.goarch == 'amd64'
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          out="dist/asdf-tui-${{ needs.version.outputs.version }}-linux-amd64"
+          out="dist/asdf-tui-${VERSION}-linux-amd64"
           got="$(./$out version)"
-          want="asdf-tui ${{ needs.version.outputs.version }}"
+          want="asdf-tui ${VERSION}"
           [[ "$got" == "$want" ]] || {
             echo "stamp mismatch: got '$got', want '$want'" >&2; exit 1
           }
           echo "verified: $got"
+
+      - name: Verify the stamp without running the binary
+        if: matrix.goos != 'linux' || matrix.goarch != 'amd64'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="dist/asdf-tui-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          # no -q: grep must drain the pipe, otherwise `strings` dies on SIGPIPE
+          # and pipefail turns a *passing* check into a failure
+          strings "$out" | grep -Fx "${VERSION}" >/dev/null \
+            || { echo "stamp missing: $out" >&2; exit 1; }
+          echo "verified ${{ matrix.goos }}/${{ matrix.goarch }}: ${VERSION}"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -137,21 +158,26 @@ jobs:
             echo "already=1" >> "$GITHUB_ENV"
           fi
 
-      - name: Build tagged artifact
+      - name: Build tagged artifacts
         if: env.already != '1'
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          for goarch in amd64 arm64; do
-            out="dist/asdf-tui-${VERSION}-linux-${goarch}"
-            CGO_ENABLED=0 GOOS=linux GOARCH=${goarch} go build -trimpath \
+          # same matrix as the build job: everything but darwin/386
+          for target in linux/386 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            out="dist/asdf-tui-${VERSION}-${goos}-${goarch}"
+            CGO_ENABLED=0 GOOS=${goos} GOARCH=${goarch} go build -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" -o "$out" .
-            if [[ "${goarch}" == "amd64" ]]; then
+            if [[ "${target}" == "linux/amd64" ]]; then
               [[ "$(./$out version)" == "asdf-tui ${VERSION}" ]] \
                 || { echo "stamp mismatch: $out" >&2; exit 1; }
             else
-              strings "$out" | grep -qxF "${VERSION}" \
+              # no -q: grep must drain the pipe, otherwise `strings` dies on
+              # SIGPIPE and pipefail turns a *passing* check into a failure
+              strings "$out" | grep -Fx "${VERSION}" >/dev/null \
                 || { echo "stamp missing: $out" >&2; exit 1; }
             fi
           done
@@ -167,4 +193,15 @@ jobs:
             ## What's new
             - Cross-compiled `asdf-tui` binaries with the version baked in —
               `asdf-tui version` now prints exactly `${{ needs.version.outputs.version }}`.
+
+            ## Binaries
+            | platform | file |
+            | --- | --- |
+            | linux/386 | `asdf-tui-${{ needs.version.outputs.version }}-linux-386` |
+            | linux/amd64 | `asdf-tui-${{ needs.version.outputs.version }}-linux-amd64` |
+            | linux/arm64 | `asdf-tui-${{ needs.version.outputs.version }}-linux-arm64` |
+            | darwin/amd64 | `asdf-tui-${{ needs.version.outputs.version }}-darwin-amd64` |
+            | darwin/arm64 | `asdf-tui-${{ needs.version.outputs.version }}-darwin-arm64` |
+
+            macOS: `chmod +x` the binary and drop it anywhere on your `PATH`.
           generate_release_notes: true

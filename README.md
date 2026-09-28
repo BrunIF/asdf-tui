@@ -22,18 +22,18 @@ Release to your `/usr/local/bin`, and verifies it runs:
 bash <(curl -sfL https://raw.githubusercontent.com/BrunIF/asdf-tui/main/install.sh)
 ```
 
-That works on **Linux** (x86-64/amd64 and arm64). The tool goes to
-`/usr/local/bin/asdf-tui`, so `sudo` will be prompted only when that directory
-is not writable by your user.
+That works on **Linux and macOS** (x86-64/amd64 and arm64, plus 32-bit x86 on
+Linux). The tool goes to `/usr/local/bin/asdf-tui`, so `sudo` will be prompted
+only when that directory is not writable by your user.
 
 If you prefer to see everything explicitly (or curl is unavailable), install
 by hand:
 
 ```bash
 # 1) find the latest version and the binary name for your machine
-AR=amd64                        # use arm64 on Linux/ARM machines
+AR=amd64                        # arm64 on ARM machines, 386 on 32-bit Linux
 BIN=asdf-tui-<VERSION>-$(uname -s | tr 'A-Z' 'a-z')-$AR
-#    e.g. asdf-tui-1.2.4-linux-amd64
+#    e.g. asdf-tui-1.2.4-linux-amd64, asdf-tui-1.2.4-darwin-arm64
 
 # 2) download it from the release into /usr/local/bin
 curl -sfL -o /tmp/$BIN \
