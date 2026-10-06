@@ -2096,7 +2096,14 @@ func (m model) renderRight(w, h int) string {
 		case len(st.versions) == 0:
 			b.WriteString("\n" + styleOk.Render("added, no versions installed yet"))
 		default:
-			b.WriteString("\n" + styleOk.Render("installed versions:") + "\n  " + strings.Join(st.versions, "\n  "))
+			b.WriteString("\n" + styleOk.Render("installed versions:"))
+			for _, v := range st.versions {
+				if st.current != "" && v == st.current {
+					b.WriteString("\n  " + styleBrand.Render(v+" (current)"))
+				} else {
+					b.WriteString("\n  " + v)
+				}
+			}
 		}
 	}
 	return b.String()
@@ -2118,6 +2125,17 @@ func (m model) renderVersions(w, h int) string {
 		b.WriteString(styleDim.Render("(no versions)"))
 		return b.String()
 	}
+	// get tool state for highlighting installed/current versions
+	st := toolSt{}
+	if name := m.selName(); name != "" {
+		if s, ok := m.state[name]; ok {
+			st = s
+		}
+	}
+	installed := make(map[string]bool, len(st.versions))
+	for _, iv := range st.versions {
+		installed[iv] = true
+	}
 	total := h - 4
 	if total < 1 {
 		total = 1
@@ -2131,10 +2149,30 @@ func (m model) renderVersions(w, h int) string {
 			break
 		}
 		v := f[i]
+		isCurrent := m.mode == verSet && st.current != "" && v == st.current
+		isInstalled := installed[v]
+		label := v
+		if m.mode == verSet && isCurrent {
+			label = v + " (current)"
+		} else if m.mode == verInstall && isInstalled {
+			label = v + " (installed)"
+		} else if m.mode == verUninstall && isCurrent {
+			label = v + " (current)"
+		}
 		if i == m.verSel {
-			b.WriteString(styleHighlight.Render(pad("› "+v, w)) + "\n")
+			if m.mode == verSet && isCurrent {
+				b.WriteString(styleBrand.Render(pad("› "+label, w)) + "\n")
+			} else {
+				b.WriteString(styleHighlight.Render(pad("› "+label, w)) + "\n")
+			}
 		} else {
-			b.WriteString("  " + v + "\n")
+			if m.mode == verSet && isCurrent {
+				b.WriteString(styleBrand.Render("  "+label) + "\n")
+			} else if (m.mode == verInstall && isInstalled) || (m.mode == verUninstall && isCurrent) {
+				b.WriteString(styleDim.Render("  "+label) + "\n")
+			} else {
+				b.WriteString("  " + label + "\n")
+			}
 		}
 	}
 	b.WriteString(m.renderDots(f, m.verSel, total, w))
